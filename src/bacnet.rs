@@ -1,8 +1,9 @@
-use crate::config::{BacnetConfig, MqttConfig};
+use crate::config::{BacnetConfig, DiscoveryBindFailurePolicy, MqttConfig};
 use crate::model::{
-    DeviceObject, DiscoveredDevice, NetworkInterface, PointConfig, PointFailure, PointSample,
-    PollOutcome,
+    DeviceObject, DiscoverOutcome, DiscoveredDevice, NetworkInterface, PointConfig, PointFailure,
+    PointSample, PollOutcome,
 };
+use crate::network::resolve_bacnet_bind_address;
 use crate::topic::telemetry_topic;
 use crate::value::{
     decode_object_identifier_value, decode_scalar_value, decode_unsigned_value,
@@ -24,14 +25,37 @@ pub type BacnetIpClient = BACnetClient<BipTransport>;
 pub async fn discover_devices(
     config: &BacnetConfig,
     interfaces: &[NetworkInterface],
-) -> Result<Vec<DiscoveredDevice>> {
+) -> Result<DiscoverOutcome> {
     let mut by_instance = HashMap::<u32, DiscoveredDevice>::new();
+    let mut warnings = Vec::new();
+    let mut bound_any = false;
+    let strict = config.discovery_bind_failure_policy == DiscoveryBindFailurePolicy::Strict;
 
     for interface in target_interfaces(config, interfaces) {
-        let mut client = build_client(config, interface)
-            .await
-            .with_context(|| format!("failed to start BACnet client on {interface}"))?;
-        client.who_is(None, None).await?;
+        let mut client = match build_client(config, interface).await {
+            Ok(client) => client,
+            Err(error) => {
+                let message = format!("failed to start BACnet client on {interface}: {error:#}");
+                if strict {
+                    return Err(anyhow!(message));
+                }
+                warnings.push(message);
+                continue;
+            }
+        };
+        bound_any = true;
+
+        if let Err(error) = client.who_is(None, None).await {
+            let message = format!("Who-Is failed on {interface}: {error}");
+            if strict {
+                client.stop().await.ok();
+                return Err(anyhow!(message));
+            }
+            warnings.push(message);
+            client.stop().await.ok();
+            continue;
+        }
+
         tokio::time::sleep(Duration::from_millis(config.discovery_window_ms)).await;
 
         for device in collect_discovered_devices(&client).await {
@@ -40,26 +64,27 @@ pub async fn discover_devices(
         client.stop().await?;
     }
 
+    if !bound_any {
+        return Err(anyhow!(
+            "discovery did not bind on any interface; check BACnet port conflicts and interface selection"
+        ));
+    }
+
     let mut devices = by_instance.into_values().collect::<Vec<_>>();
     devices.sort_by_key(|device| device.instance);
-    Ok(devices)
+    Ok(DiscoverOutcome { devices, warnings })
 }
 
 pub async fn scan_device_objects(
     config: &BacnetConfig,
+    interfaces: &[NetworkInterface],
     device_instance: u32,
     max_objects: usize,
 ) -> Result<Vec<DeviceObject>> {
-    let mut client = build_client(
-        config,
-        config.selected_interface.unwrap_or(Ipv4Addr::UNSPECIFIED),
-    )
-    .await
-    .context("failed to start BACnet client")?;
-    client
-        .who_is(Some(device_instance), Some(device_instance))
-        .await?;
-    tokio::time::sleep(Duration::from_millis(config.discovery_window_ms)).await;
+    let mut client = build_client(config, resolve_bacnet_bind_address(config, interfaces))
+        .await
+        .context("failed to start BACnet client")?;
+    refresh_device_table(&client, config, &[device_instance]).await?;
 
     let objects = scan_device_objects_with_client(&client, device_instance, max_objects).await;
     client.stop().await?;
@@ -177,6 +202,7 @@ pub async fn scan_device_objects_with_client(
 
 pub async fn poll_points_once(
     bacnet: &BacnetConfig,
+    interfaces: &[NetworkInterface],
     mqtt: &MqttConfig,
     points: &[PointConfig],
 ) -> Result<PollOutcome> {
@@ -193,18 +219,66 @@ pub async fn poll_points_once(
         });
     }
 
-    let mut client = build_client(
-        bacnet,
-        bacnet.selected_interface.unwrap_or(Ipv4Addr::UNSPECIFIED),
-    )
-    .await
-    .context("failed to start BACnet client")?;
-    client.who_is(None, None).await?;
-    tokio::time::sleep(Duration::from_millis(bacnet.discovery_window_ms)).await;
+    let mut client = build_client(bacnet, resolve_bacnet_bind_address(bacnet, interfaces))
+        .await
+        .context("failed to start BACnet client")?;
+    let instances = enabled
+        .iter()
+        .map(|point| point.device_instance)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let refresh = match refresh_device_table(&client, bacnet, &instances).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            client.stop().await?;
+            return Err(error);
+        }
+    };
 
-    let outcome = poll_points_once_with_client(&client, mqtt, &enabled).await;
+    // Pre-filter: don't even attempt reads to unresolved devices. Each unresolved device
+    // would otherwise produce one "RPM failed" warning + one fast-fail per point as the
+    // RPM fallback path tries individual reads. Mark them as point failures upfront with
+    // a single clean reason.
+    let unresolved_set: HashSet<u32> = refresh.unresolved.iter().copied().collect();
+    let (pollable, skipped): (Vec<PointConfig>, Vec<PointConfig>) = enabled
+        .into_iter()
+        .partition(|point| !unresolved_set.contains(&point.device_instance));
+
+    let mut outcome = poll_points_once_with_client(&client, mqtt, &pollable).await?;
+    for point in skipped {
+        let device_instance = point.device_instance;
+        outcome.failures.push(PointFailure {
+            point,
+            error: format!("device {device_instance} not in I-Am cache"),
+        });
+    }
+    if !refresh.unresolved.is_empty() {
+        outcome
+            .warnings
+            .insert(0, format_unresolved_warning(&refresh.unresolved));
+    }
     client.stop().await?;
-    outcome
+    Ok(outcome)
+}
+
+fn format_unresolved_warning(unresolved: &[u32]) -> String {
+    const MAX_LIST: usize = 10;
+    if unresolved.len() <= MAX_LIST {
+        format!(
+            "{} device(s) unresolved (not in I-Am cache): {:?}",
+            unresolved.len(),
+            unresolved
+        )
+    } else {
+        let head = &unresolved[..MAX_LIST];
+        format!(
+            "{} device(s) unresolved (not in I-Am cache); first {}: {:?}",
+            unresolved.len(),
+            MAX_LIST,
+            head
+        )
+    }
 }
 
 pub async fn poll_points_once_with_client(
@@ -254,14 +328,23 @@ pub async fn poll_points_once_with_client(
     })
 }
 
-pub fn point_from_object(object: &DeviceObject) -> PointConfig {
-    let label = format!("device_{}", object.device_instance);
-    let path_name = object
+pub fn point_from_object(object: &DeviceObject, device_label: Option<&str>) -> PointConfig {
+    let label = device_label
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("device_{}", object.device_instance));
+    let point_name = object
         .object_name
         .as_ref()
         .filter(|name| !name.trim().is_empty())
         .cloned()
         .unwrap_or_else(|| format!("{}_{}", object.object_type, object.object_instance));
+    let tag_path = if device_label.is_some() {
+        format!("{label}/{point_name}")
+    } else {
+        point_name
+    };
     PointConfig {
         enabled: true,
         device_instance: object.device_instance,
@@ -269,9 +352,25 @@ pub fn point_from_object(object: &DeviceObject) -> PointConfig {
         object_type: object.object_type.clone(),
         object_instance: object.object_instance,
         property: "present_value".to_string(),
-        tag_path: path_name,
+        tag_path,
         poll_interval_secs: 10,
     }
+}
+
+pub(crate) async fn read_device_label(client: &BacnetIpClient, device_instance: u32) -> String {
+    let Ok(device_oid) = ObjectIdentifier::new(ObjectType::DEVICE, device_instance) else {
+        return format!("device_{device_instance}");
+    };
+    read_scalar_property(
+        client,
+        device_instance,
+        device_oid,
+        PropertyIdentifier::OBJECT_NAME,
+    )
+    .await
+    .map(|value| value.to_string())
+    .filter(|value| !value.trim().is_empty())
+    .unwrap_or_else(|| format!("device_{device_instance}"))
 }
 
 struct PollRequest {
@@ -407,7 +506,44 @@ async fn read_device_group_individual(
     results
 }
 
-async fn build_client(config: &BacnetConfig, interface: Ipv4Addr) -> Result<BacnetIpClient> {
+#[derive(Debug, Default, Clone)]
+pub struct RefreshOutcome {
+    pub resolved: Vec<u32>,
+    pub unresolved: Vec<u32>,
+}
+
+pub(crate) async fn refresh_device_table(
+    client: &BacnetIpClient,
+    config: &BacnetConfig,
+    device_instances: &[u32],
+) -> Result<RefreshOutcome> {
+    client.who_is(None, None).await?;
+    tokio::time::sleep(Duration::from_millis(config.discovery_window_ms)).await;
+
+    // Partition into resolved / unresolved from the broadcast cache only. A per-instance
+    // follow-up Who-Is here is both slow (3 s sleep each) and rarely helpful — if a
+    // device's I-Am dropped in the broadcast burst, a unicast Who-Is on the same socket
+    // drops with similar probability. We accept the partial set and let downstream reads
+    // surface per-point failures with clear errors.
+    let mut resolved = Vec::with_capacity(device_instances.len());
+    let mut unresolved = Vec::new();
+    for &device_instance in device_instances {
+        if client.get_device(device_instance).await.is_some() {
+            resolved.push(device_instance);
+        } else {
+            unresolved.push(device_instance);
+        }
+    }
+    Ok(RefreshOutcome {
+        resolved,
+        unresolved,
+    })
+}
+
+pub(crate) async fn build_client(
+    config: &BacnetConfig,
+    interface: Ipv4Addr,
+) -> Result<BacnetIpClient> {
     let mut transport = BipTransport::new(interface, config.port, config.broadcast_address);
     if let Some(bbmd) = &config.bbmd {
         transport.register_as_foreign_device(ForeignDeviceConfig {
@@ -472,10 +608,14 @@ mod tests {
             present_value: None,
         };
 
-        let point = point_from_object(&object);
+        let point = point_from_object(&object, None);
 
         assert_eq!(point.device_instance, 100);
         assert_eq!(point.tag_path, "AHU1 Supply Temp");
+
+        let labeled = point_from_object(&object, Some("AHU-1"));
+        assert_eq!(labeled.tag_path, "AHU-1/AHU1 Supply Temp");
+        assert_eq!(labeled.device_label, "AHU-1");
     }
 
     #[test]

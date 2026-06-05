@@ -34,8 +34,32 @@ pub struct BacnetConfig {
     pub discovery_window_ms: u64,
     #[serde(default = "default_apdu_timeout_ms")]
     pub apdu_timeout_ms: u64,
+    #[serde(default = "default_discovery_bind_failure_policy")]
+    pub discovery_bind_failure_policy: DiscoveryBindFailurePolicy,
     #[serde(default)]
     pub bbmd: Option<BbmdConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryBindFailurePolicy {
+    /// Skip interfaces that cannot bind and continue on the remaining NICs.
+    Skip,
+    /// Abort discovery when any selected interface cannot bind.
+    Strict,
+}
+
+impl std::fmt::Display for DiscoveryBindFailurePolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Skip => formatter.write_str("Skip failed interfaces"),
+            Self::Strict => formatter.write_str("Fail on bind error"),
+        }
+    }
+}
+
+impl DiscoveryBindFailurePolicy {
+    pub const ALL: [Self; 2] = [Self::Skip, Self::Strict];
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -213,6 +237,7 @@ impl Default for BacnetConfig {
             broadcast_address: default_broadcast_address(),
             discovery_window_ms: default_discovery_window_ms(),
             apdu_timeout_ms: default_apdu_timeout_ms(),
+            discovery_bind_failure_policy: default_discovery_bind_failure_policy(),
             bbmd: None,
         }
     }
@@ -318,6 +343,10 @@ fn default_discovery_window_ms() -> u64 {
 
 fn default_apdu_timeout_ms() -> u64 {
     2_000
+}
+
+fn default_discovery_bind_failure_policy() -> DiscoveryBindFailurePolicy {
+    DiscoveryBindFailurePolicy::Skip
 }
 
 fn default_foreign_device_ttl_secs() -> u16 {
@@ -444,6 +473,15 @@ theme = "auto"
         assert_eq!(config.mqtt.client_cert_path, None);
         assert_eq!(config.mqtt.client_key_path, None);
         assert_eq!(config.mqtt.client_key_passphrase, None);
+    }
+
+    #[test]
+    fn default_discovery_bind_failure_policy_is_skip() {
+        let config = BacnetConfig::default();
+        assert_eq!(
+            config.discovery_bind_failure_policy,
+            DiscoveryBindFailurePolicy::Skip
+        );
     }
 
     #[test]

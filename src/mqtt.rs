@@ -13,9 +13,14 @@ use std::time::{Duration, Instant};
 use tokio::time::{sleep, timeout};
 
 const DRAIN_SLICE: Duration = Duration::from_millis(250);
-const PUBLISH_DRAIN: Duration = Duration::from_secs(2);
+const PUBLISH_DRAIN: Duration = Duration::from_secs(5);
+const INTERLEAVE_DRAIN: Duration = Duration::from_millis(150);
+const INTERLEAVE_EVERY: usize = 16;
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+// rumqttc's outbound channel must hold the entire burst — publish() blocks if it fills.
+// Sized for full-fleet bursts (~1500 points) with comfortable headroom.
+const OUTBOUND_CHANNEL_CAPACITY: usize = 4096;
 
 pub trait MqttPublisher {
     fn publish<'a>(
@@ -87,7 +92,7 @@ impl RumqttPublisher {
         if let Some(username) = config.username.as_deref().filter(|value| !value.is_empty()) {
             options.set_credentials(username, config.password.clone().unwrap_or_default());
         }
-        let (client, eventloop) = AsyncClient::new(options, 64);
+        let (client, eventloop) = AsyncClient::new(options, OUTBOUND_CHANNEL_CAPACITY);
         Ok(Self {
             client,
             eventloop,
@@ -125,6 +130,7 @@ impl RumqttPublisher {
         samples: &[PointSample],
     ) -> PublishStats {
         let mut stats = PublishStats::empty();
+        let mut since_drain = 0usize;
         for sample in samples {
             stats.queued += 1;
             let payload = match serde_json::to_vec(&sample.value.as_json_value()) {
@@ -142,13 +148,31 @@ impl RumqttPublisher {
             {
                 stats.record_failure(error.to_string());
             }
+
+            // Interleave a short eventloop drain every N publishes so the outbound
+            // channel never sits full. Without this, large bursts (1000+ samples) can
+            // saturate the channel before the eventloop processes anything, and the
+            // next publish().await blocks indefinitely.
+            since_drain += 1;
+            if since_drain >= INTERLEAVE_EVERY {
+                since_drain = 0;
+                if let Ok(drain_stats) = self.drain_for(INTERLEAVE_DRAIN).await {
+                    stats.reconnects += drain_stats.reconnects;
+                    if drain_stats.last_error.is_some() {
+                        stats.last_error = drain_stats.last_error;
+                    }
+                }
+            }
         }
 
+        // Final drain to flush any remaining queued publishes.
         if stats.failed == 0 {
             match self.drain_for(PUBLISH_DRAIN).await {
                 Ok(drain_stats) => {
                     stats.reconnects += drain_stats.reconnects;
-                    stats.last_error = drain_stats.last_error;
+                    if drain_stats.last_error.is_some() {
+                        stats.last_error = drain_stats.last_error;
+                    }
                     stats.published = stats.queued;
                 }
                 Err(error) => {

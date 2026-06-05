@@ -9,8 +9,68 @@ permissions:
   contents: write
 
 jobs:
+  linux:
+    name: Build Linux executable
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup component add rustfmt clippy --toolchain stable
+          rustup default stable
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libxcursor-dev \
+            libxinerama-dev \
+            libgl1-mesa-dev \
+            libegl1-mesa-dev \
+            zip
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release
+        run: cargo build --locked --release
+
+      - name: Package executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          package="bacnet-republisher-${tag}-linux-x86_64"
+          mkdir -p "dist/${package}"
+          cp target/release/bacnet-republisher "dist/${package}/"
+          cp README.md "dist/${package}/"
+          (cd "dist/${package}" && zip -r "../${package}.zip" .)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: bacnet-republisher-linux-x86_64
+          path: dist/*.zip
+          if-no-files-found: error
+
   windows:
-    name: Build signed Windows executable
+    name: Build Windows executable
     runs-on: windows-2025-vs2026
 
     steps:
@@ -35,40 +95,7 @@ jobs:
       - name: Build release
         run: cargo build --locked --release
 
-      - name: Decode signing certificate
-        shell: pwsh
-        run: |
-          $certBytes = [Convert]::FromBase64String("${{ secrets.WINDOWS_CODESIGN_CERT_BASE64 }}")
-          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\codesign" | Out-Null
-          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\codesign\codesign.pfx", $certBytes)
-
-      - name: Sign executable
-        shell: pwsh
-        env:
-          CERT_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_CERT_PASSWORD }}
-          TIMESTAMP_URL: ${{ vars.WINDOWS_CODESIGN_TIMESTAMP_URL || 'http://timestamp.digicert.com' }}
-        run: |
-          $exe = "$env:GITHUB_WORKSPACE\target\release\bacnet-republisher.exe"
-          $pfx = "$env:RUNNER_TEMP\codesign\codesign.pfx"
-          $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
-            Where-Object { $_.FullName -match "\\x64\\signtool.exe$" } |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1).FullName
-          if (-not $signtool) { throw "signtool.exe not found" }
-          & $signtool sign /f $pfx /p $env:CERT_PASSWORD /fd SHA256 /tr $env:TIMESTAMP_URL /td SHA256 /v $exe
-          if ($LASTEXITCODE -ne 0) { throw "SignTool failed with exit code $LASTEXITCODE" }
-
-      - name: Verify signature
-        shell: pwsh
-        run: |
-          $exe = "$env:GITHUB_WORKSPACE\target\release\bacnet-republisher.exe"
-          $signature = Get-AuthenticodeSignature $exe
-          $signature | Format-List
-          if ($signature.Status -ne "Valid") {
-            throw "Authenticode signature status is $($signature.Status)"
-          }
-
-      - name: Package signed executable
+      - name: Package executable
         shell: pwsh
         run: |
           $tag = $env:GITHUB_REF_NAME
@@ -88,7 +115,7 @@ jobs:
 
   publish:
     name: Publish GitHub release
-    needs: windows
+    needs: [linux, windows]
     runs-on: ubuntu-24.04
     permissions:
       actions: read

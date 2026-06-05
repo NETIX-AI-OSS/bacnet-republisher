@@ -1,13 +1,19 @@
-use crate::bacnet::{discover_devices, poll_points_once, scan_device_objects};
+use crate::bacnet::{
+    build_client, discover_devices, point_from_object, poll_points_once,
+    poll_points_once_with_client, read_device_label, refresh_device_table, scan_device_objects,
+    scan_device_objects_with_client,
+};
 use crate::config::{BacnetConfig, MqttConfig};
+use crate::import::merge_imported_points;
 use crate::log::LogLevel;
 use crate::model::{
-    DeviceObject, DiscoveredDevice, NetworkInterface, PointConfig, PointFailure, PointIdentity,
-    PointSample, PointStatus, PublishStats,
+    BulkTagImportOutcome, DeviceObject, DiscoveredDevice, NetworkInterface, PointConfig,
+    PointFailure, PointIdentity, PointSample, PointStatus, PublishStats,
 };
 use crate::mqtt::{publish_health, HealthSnapshot, RumqttPublisher};
+use crate::network::resolve_bacnet_bind_address;
 use crossbeam_channel::Sender;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -19,6 +25,8 @@ pub enum WorkerEvent {
     Log(LogLevel, String),
     Devices(Vec<DiscoveredDevice>),
     Objects(Vec<DeviceObject>),
+    ScanProgress { current: usize, total: usize },
+    BulkTagImport(BulkTagImportOutcome),
     Samples(Vec<PointSample>),
     Failures(Vec<PointFailure>),
     PublishStatus(PublishStats),
@@ -39,14 +47,23 @@ pub fn spawn_discovery(
                 ))
                 .ok();
             match discover_devices(&config, &interfaces).await {
-                Ok(devices) => {
-                    let count = devices.len();
-                    sender.send(WorkerEvent::Devices(devices)).ok();
-                    sender
-                        .send(WorkerEvent::Finished(format!(
-                            "Discovered {count} BACnet device(s)"
-                        )))
-                        .ok();
+                Ok(outcome) => {
+                    for warning in &outcome.warnings {
+                        sender
+                            .send(WorkerEvent::Log(LogLevel::Warning, warning.clone()))
+                            .ok();
+                    }
+                    let count = outcome.devices.len();
+                    sender.send(WorkerEvent::Devices(outcome.devices)).ok();
+                    let summary = if outcome.warnings.is_empty() {
+                        format!("Discovered {count} BACnet device(s)")
+                    } else {
+                        format!(
+                            "Discovered {count} BACnet device(s) with {} interface warning(s)",
+                            outcome.warnings.len()
+                        )
+                    };
+                    sender.send(WorkerEvent::Finished(summary)).ok();
                 }
                 Err(error) => {
                     sender
@@ -64,7 +81,153 @@ pub fn spawn_discovery(
     });
 }
 
-pub fn spawn_object_scan(sender: Sender<WorkerEvent>, config: BacnetConfig, device_instance: u32) {
+const SCAN_ALL_MAX_OBJECTS_PER_DEVICE: usize = 512;
+
+pub fn spawn_scan_all_objects(
+    sender: Sender<WorkerEvent>,
+    config: BacnetConfig,
+    interfaces: Vec<NetworkInterface>,
+    devices: Vec<DiscoveredDevice>,
+    existing_points: Vec<PointConfig>,
+) {
+    std::thread::spawn(move || {
+        run_async(sender.clone(), async move {
+            let device_instances = devices.iter().map(|d| d.instance).collect::<Vec<_>>();
+            let total = device_instances.len();
+            sender
+                .send(WorkerEvent::Log(
+                    LogLevel::Info,
+                    format!("Scanning object lists for {total} device(s)"),
+                ))
+                .ok();
+            sender
+                .send(WorkerEvent::ScanProgress { current: 0, total })
+                .ok();
+
+            // One shared client for the whole sweep. Building a fresh client per device
+            // re-broadcasts Who-Is and races against the simulator's I-Am responses, which
+            // is why per-device scans fail under load.
+            let bind = resolve_bacnet_bind_address(&config, &interfaces);
+            let mut client = match build_client(&config, bind).await {
+                Ok(c) => c,
+                Err(error) => {
+                    sender
+                        .send(WorkerEvent::Log(
+                            LogLevel::Error,
+                            format!("Failed to start BACnet client for scan-all: {error:#}"),
+                        ))
+                        .ok();
+                    sender
+                        .send(WorkerEvent::Finished("Scan all failed".to_string()))
+                        .ok();
+                    return;
+                }
+            };
+
+            match refresh_device_table(&client, &config, &device_instances).await {
+                Ok(refresh) if !refresh.unresolved.is_empty() => {
+                    sender
+                        .send(WorkerEvent::Log(
+                            LogLevel::Warning,
+                            format!(
+                                "{} of {} device(s) not in I-Am cache after broadcast; their scans will fail",
+                                refresh.unresolved.len(),
+                                device_instances.len()
+                            ),
+                        ))
+                        .ok();
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    sender
+                        .send(WorkerEvent::Log(
+                            LogLevel::Warning,
+                            format!("Device table refresh failed: {error:#}"),
+                        ))
+                        .ok();
+                }
+            }
+
+            let mut all_objects = Vec::new();
+            let mut imported_points = Vec::new();
+            let mut failures = 0usize;
+            for (idx, &device_instance) in device_instances.iter().enumerate() {
+                let device_label = read_device_label(&client, device_instance).await;
+                match scan_device_objects_with_client(
+                    &client,
+                    device_instance,
+                    SCAN_ALL_MAX_OBJECTS_PER_DEVICE,
+                )
+                .await
+                {
+                    Ok(objects) => {
+                        let count = objects.len();
+                        for object in &objects {
+                            imported_points.push(point_from_object(object, Some(&device_label)));
+                        }
+                        all_objects.extend(objects);
+                        sender
+                            .send(WorkerEvent::Log(
+                                LogLevel::Info,
+                                format!(
+                                    "[{}/{}] device {}: {} object(s)",
+                                    idx + 1,
+                                    total,
+                                    device_instance,
+                                    count
+                                ),
+                            ))
+                            .ok();
+                    }
+                    Err(error) => {
+                        failures += 1;
+                        sender
+                            .send(WorkerEvent::Log(
+                                LogLevel::Warning,
+                                format!("device {device_instance}: scan failed: {error:#}"),
+                            ))
+                            .ok();
+                    }
+                }
+                sender
+                    .send(WorkerEvent::ScanProgress {
+                        current: idx + 1,
+                        total,
+                    })
+                    .ok();
+            }
+            client.stop().await.ok();
+
+            let scanned = all_objects.len();
+            let merge = merge_imported_points(&existing_points, &imported_points);
+            let added = merge.added;
+            let updated = merge.updated;
+            let total_points = merge.points.len();
+            sender
+                .send(WorkerEvent::BulkTagImport(BulkTagImportOutcome {
+                    devices,
+                    scanned_objects: all_objects,
+                    points: merge.points,
+                    added,
+                    updated,
+                    warnings: Vec::new(),
+                }))
+                .ok();
+            sender
+                .send(WorkerEvent::Finished(format!(
+                    "Scanned {scanned} object(s) across {total} device(s) ({failures} failure(s)) — {added} point(s) added, {updated} updated, {total_points} total"
+                )))
+                .ok();
+        });
+    });
+}
+
+pub fn spawn_object_scan(
+    sender: Sender<WorkerEvent>,
+    config: BacnetConfig,
+    interfaces: Vec<NetworkInterface>,
+    device_instance: u32,
+) {
     std::thread::spawn(move || {
         run_async(sender.clone(), async move {
             sender
@@ -73,7 +236,7 @@ pub fn spawn_object_scan(sender: Sender<WorkerEvent>, config: BacnetConfig, devi
                     format!("Scanning object list for device {device_instance}"),
                 ))
                 .ok();
-            match scan_device_objects(&config, device_instance, 512).await {
+            match scan_device_objects(&config, &interfaces, device_instance, 512).await {
                 Ok(objects) => {
                     let count = objects.len();
                     sender.send(WorkerEvent::Objects(objects)).ok();
@@ -102,6 +265,7 @@ pub fn spawn_object_scan(sender: Sender<WorkerEvent>, config: BacnetConfig, devi
 pub fn spawn_poll_and_publish(
     sender: Sender<WorkerEvent>,
     bacnet: BacnetConfig,
+    interfaces: Vec<NetworkInterface>,
     mqtt: MqttConfig,
     points: Vec<PointConfig>,
 ) {
@@ -113,7 +277,7 @@ pub fn spawn_poll_and_publish(
                     format!("Polling {} configured point(s)", points.len()),
                 ))
                 .ok();
-            let outcome = match poll_points_once(&bacnet, &mqtt, &points).await {
+            let outcome = match poll_points_once(&bacnet, &interfaces, &mqtt, &points).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     sender
@@ -201,6 +365,7 @@ pub fn spawn_poll_and_publish(
 pub fn spawn_republisher(
     sender: Sender<WorkerEvent>,
     bacnet: BacnetConfig,
+    interfaces: Vec<NetworkInterface>,
     mqtt: MqttConfig,
     points: Vec<PointConfig>,
     stop: Arc<AtomicBool>,
@@ -235,6 +400,67 @@ pub fn spawn_republisher(
                 }
             };
 
+            // ONE BACnet client for the lifetime of the republisher. Building/tearing down
+            // per poll cycle races on the UDP port bind ("Address already in use") because
+            // the kernel hasn't released 47808 by the time the next cycle reclaims it.
+            let bind = resolve_bacnet_bind_address(&bacnet, &interfaces);
+            let mut client = match build_client(&bacnet, bind).await {
+                Ok(c) => c,
+                Err(error) => {
+                    sender
+                        .send(WorkerEvent::Log(
+                            LogLevel::Error,
+                            format!("Failed to start BACnet client: {error:#}"),
+                        ))
+                        .ok();
+                    sender
+                        .send(WorkerEvent::Finished(
+                            "Continuous republisher failed".to_string(),
+                        ))
+                        .ok();
+                    return;
+                }
+            };
+            let unique_device_instances = points
+                .iter()
+                .filter(|p| p.enabled)
+                .map(|p| p.device_instance)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let unresolved_devices: HashSet<u32> = match refresh_device_table(
+                &client,
+                &bacnet,
+                &unique_device_instances,
+            )
+            .await
+            {
+                Ok(refresh) => {
+                    if !refresh.unresolved.is_empty() {
+                        sender
+                                .send(WorkerEvent::Log(
+                                    LogLevel::Warning,
+                                    format!(
+                                        "{} of {} device(s) not in I-Am cache; their points will be skipped (restart republisher to re-attempt)",
+                                        refresh.unresolved.len(),
+                                        unique_device_instances.len()
+                                    ),
+                                ))
+                                .ok();
+                    }
+                    refresh.unresolved.into_iter().collect()
+                }
+                Err(error) => {
+                    sender
+                        .send(WorkerEvent::Log(
+                            LogLevel::Warning,
+                            format!("Device table refresh failed: {error:#}"),
+                        ))
+                        .ok();
+                    HashSet::new()
+                }
+            };
+
             let mut last_polled = HashMap::<usize, Instant>::new();
             let mut point_statuses = HashMap::<PointIdentity, PointStatus>::new();
             while !stop.load(Ordering::Relaxed) {
@@ -244,6 +470,7 @@ pub fn spawn_republisher(
                     .enumerate()
                     .filter(|(index, point)| {
                         point.enabled
+                            && !unresolved_devices.contains(&point.device_instance)
                             && last_polled
                                 .get(index)
                                 .map(|last| {
@@ -260,7 +487,7 @@ pub fn spawn_republisher(
                         .iter()
                         .map(|(_, point)| point.clone())
                         .collect::<Vec<_>>();
-                    match poll_points_once(&bacnet, &mqtt, &poll_set).await {
+                    match poll_points_once_with_client(&client, &mqtt, &poll_set).await {
                         Ok(outcome) => {
                             for (index, _) in due_points {
                                 last_polled.insert(index, now);
@@ -332,6 +559,7 @@ pub fn spawn_republisher(
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
 
+            client.stop().await.ok();
             sender
                 .send(WorkerEvent::Finished(
                     "Continuous republisher stopped".to_string(),

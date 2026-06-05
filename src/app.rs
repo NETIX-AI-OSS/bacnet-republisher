@@ -1,25 +1,25 @@
 use crate::bacnet::point_from_object;
-use crate::config::{self, AppConfig, BbmdConfig, UiTheme};
+use crate::config::{self, AppConfig, BbmdConfig, DiscoveryBindFailurePolicy, UiTheme};
 use crate::log::{LogBuffer, LogLevel};
 use crate::model::{
     DeviceObject, DiscoveredDevice, NetworkInterface, PointConfig, PointIdentity, PointSample,
     PointStatus,
 };
 use crate::network::{interface_choices, ipv4_interfaces};
+use crate::ui::{self, ButtonKind, ChipKind, Icon};
 use crate::worker::{
-    spawn_discovery, spawn_object_scan, spawn_poll_and_publish, spawn_republisher, WorkerEvent,
+    spawn_discovery, spawn_object_scan, spawn_poll_and_publish, spawn_republisher,
+    spawn_scan_all_objects, WorkerEvent,
 };
+use chrono::{DateTime, Local, Utc};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, text, text_input, Column,
+    checkbox, column, container, pick_list, progress_bar, row, scrollable, text, Column,
 };
-use iced::{
-    theme, window, Alignment, Background, Border, Color, Element, Length, Shadow, Size,
-    Subscription, Task, Theme,
-};
+use iced::{theme, window, Alignment, Element, Length, Size, Subscription, Task, Theme};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -36,6 +36,7 @@ pub struct BacnetRepublisher {
     interface_choices: Vec<Ipv4Addr>,
     devices: Vec<DiscoveredDevice>,
     scanned_objects: Vec<DeviceObject>,
+    scan_progress: Option<(usize, usize)>,
     samples: Vec<PointSample>,
     point_statuses: HashMap<PointIdentity, PointStatus>,
     status: String,
@@ -59,6 +60,7 @@ pub enum Message {
     InterfaceSelected(Ipv4Addr),
     Discover,
     ScanObjects(u32),
+    ScanAllObjects,
     AddObjectAsPoint(usize),
     PollAndPublish,
     StartRepublisher,
@@ -70,6 +72,7 @@ pub enum Message {
     BroadcastAddressChanged(String),
     DiscoveryWindowChanged(String),
     ApduTimeoutChanged(String),
+    DiscoveryBindFailurePolicySelected(DiscoveryBindFailurePolicy),
     BbmdEnabledChanged(bool),
     BbmdAddressChanged(String),
     BbmdPortChanged(String),
@@ -106,6 +109,7 @@ pub enum Message {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
+    Overview,
     Discover,
     Points,
     Republish,
@@ -116,6 +120,7 @@ pub enum Page {
 impl std::fmt::Display for Page {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Overview => formatter.write_str("Overview"),
             Self::Discover => formatter.write_str("Discover"),
             Self::Points => formatter.write_str("Points"),
             Self::Republish => formatter.write_str("Republish"),
@@ -131,6 +136,7 @@ struct SettingsDraft {
     broadcast_address: String,
     discovery_window_ms: String,
     apdu_timeout_ms: String,
+    discovery_bind_failure_policy: DiscoveryBindFailurePolicy,
     bbmd_enabled: bool,
     bbmd_address: String,
     bbmd_port: String,
@@ -160,6 +166,7 @@ impl SettingsDraft {
             broadcast_address: config.bacnet.broadcast_address.to_string(),
             discovery_window_ms: config.bacnet.discovery_window_ms.to_string(),
             apdu_timeout_ms: config.bacnet.apdu_timeout_ms.to_string(),
+            discovery_bind_failure_policy: config.bacnet.discovery_bind_failure_policy,
             bbmd_enabled: bbmd.is_some(),
             bbmd_address: bbmd
                 .as_ref()
@@ -201,6 +208,7 @@ impl SettingsDraft {
         config.bacnet.discovery_window_ms =
             parse_u64(&self.discovery_window_ms, "discovery window")?;
         config.bacnet.apdu_timeout_ms = parse_u64(&self.apdu_timeout_ms, "APDU timeout")?;
+        config.bacnet.discovery_bind_failure_policy = self.discovery_bind_failure_policy;
         config.bacnet.bbmd = if self.bbmd_enabled {
             Some(BbmdConfig {
                 address: parse_ipv4(&self.bbmd_address, "BBMD address")?,
@@ -308,11 +316,12 @@ impl BacnetRepublisher {
                 point_editor: PointEditor::new(),
                 config,
                 config_path,
-                selected_page: Page::Discover,
+                selected_page: initial_page(),
                 interfaces,
                 interface_choices,
                 devices: Vec::new(),
                 scanned_objects: Vec::new(),
+                scan_progress: None,
                 samples: Vec::new(),
                 point_statuses: HashMap::new(),
                 status,
@@ -337,11 +346,7 @@ impl BacnetRepublisher {
     }
 
     fn app_style(&self, _theme: &Theme) -> theme::Style {
-        let palette = self.palette();
-        theme::Style {
-            background_color: palette.background,
-            text_color: palette.text,
-        }
+        ui::app_style(self.palette())
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -367,6 +372,7 @@ impl BacnetRepublisher {
             }
             Message::Discover => self.start_discovery(),
             Message::ScanObjects(device_instance) => self.start_object_scan(device_instance),
+            Message::ScanAllObjects => self.start_scan_all_objects(),
             Message::AddObjectAsPoint(index) => self.add_object_as_point(index),
             Message::PollAndPublish => self.start_poll_and_publish(),
             Message::StartRepublisher => self.start_republisher(),
@@ -381,6 +387,9 @@ impl BacnetRepublisher {
             Message::BroadcastAddressChanged(value) => self.settings.broadcast_address = value,
             Message::DiscoveryWindowChanged(value) => self.settings.discovery_window_ms = value,
             Message::ApduTimeoutChanged(value) => self.settings.apdu_timeout_ms = value,
+            Message::DiscoveryBindFailurePolicySelected(value) => {
+                self.settings.discovery_bind_failure_policy = value;
+            }
             Message::BbmdEnabledChanged(value) => self.settings.bbmd_enabled = value,
             Message::BbmdAddressChanged(value) => self.settings.bbmd_address = value,
             Message::BbmdPortChanged(value) => self.settings.bbmd_port = value,
@@ -437,22 +446,59 @@ impl BacnetRepublisher {
         let palette = self.palette();
         let sidebar = container(
             column![
-                text("NETIX").size(16),
-                text("BACnet Republisher").size(22),
+                ui::brand(),
+                ui::chip(
+                    palette,
+                    if self.republishing {
+                        "LIVE REPUBLISH"
+                    } else {
+                        "STANDBY"
+                    },
+                    if self.republishing {
+                        ChipKind::Success
+                    } else {
+                        ChipKind::Neutral
+                    }
+                ),
                 iced::widget::rule::horizontal(1),
+                self.nav_button(Page::Overview),
                 self.nav_button(Page::Discover),
                 self.nav_button(Page::Points),
                 self.nav_button(Page::Republish),
                 self.nav_button(Page::Settings),
                 self.nav_button(Page::Logs),
+                container(
+                    column![
+                        ui::eyebrow(palette, "MQTT TARGET"),
+                        text(format!(
+                            "{}:{}",
+                            self.config.mqtt.host, self.config.mqtt.port
+                        ))
+                        .size(13)
+                        .color(palette.text),
+                        text(if self.config.mqtt.use_tls {
+                            "TLS enabled"
+                        } else {
+                            "Plain TCP"
+                        })
+                        .size(12)
+                        .color(palette.muted),
+                    ]
+                    .spacing(4)
+                )
+                .padding(12)
+                .width(Length::Fill)
+                .style(move |_| ui::row_style(palette)),
             ]
-            .spacing(10)
-            .padding(16)
-            .width(Length::Fixed(230.0)),
+            .spacing(11)
+            .padding(18)
+            .width(Length::Fixed(260.0)),
         )
-        .style(move |_| container_style(palette.panel, palette.border));
+        .height(Length::Fill)
+        .style(move |_| ui::sidebar_style(palette));
 
         let content = match self.selected_page {
+            Page::Overview => self.overview_page(),
             Page::Discover => self.discover_page(),
             Page::Points => self.points_page(),
             Page::Republish => self.republish_page(),
@@ -460,118 +506,450 @@ impl BacnetRepublisher {
             Page::Logs => self.logs_page(),
         };
 
-        row![sidebar, content].height(Length::Fill).into()
+        row![
+            sidebar,
+            column![content, self.status_bar()].height(Length::Fill)
+        ]
+        .height(Length::Fill)
+        .into()
+    }
+
+    fn overview_page(&self) -> Element<'_, Message> {
+        let palette = self.palette();
+        let publish_kind = if self.republishing {
+            ChipKind::Success
+        } else if self.enabled_point_count() == 0 {
+            ChipKind::Warning
+        } else {
+            ChipKind::Accent
+        };
+        let last_state = self.last_point_state();
+
+        let metrics = row![
+            ui::metric(
+                palette,
+                "Republisher",
+                if self.republishing {
+                    "Running"
+                } else {
+                    "Stopped"
+                },
+                format!("{} enabled point(s)", self.enabled_point_count()),
+                publish_kind
+            ),
+            ui::metric(
+                palette,
+                "Discovery",
+                self.devices.len().to_string(),
+                format!("{} scanned object(s)", self.scanned_objects.len()),
+                ChipKind::Accent
+            ),
+            ui::metric(
+                palette,
+                "Samples",
+                self.samples.len().to_string(),
+                last_state,
+                self.overall_point_kind()
+            ),
+        ]
+        .spacing(14);
+
+        let operations = ui::card(
+            palette,
+            column![
+                ui::section_title(palette, "Primary operations"),
+                row![
+                    ui::action_button(palette, Icon::Discover, "Discover", ButtonKind::Primary)
+                        .on_press(Message::Discover),
+                    ui::action_button(palette, Icon::Publish, "Poll once", ButtonKind::Secondary)
+                        .on_press(Message::PollAndPublish),
+                    ui::action_button(
+                        palette,
+                        Icon::Start,
+                        if self.republishing {
+                            "Running"
+                        } else {
+                            "Start republisher"
+                        },
+                        ButtonKind::Secondary
+                    )
+                    .on_press(Message::StartRepublisher),
+                    ui::action_button(palette, Icon::Stop, "Stop", ButtonKind::Danger)
+                        .on_press(Message::StopRepublisher),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+                row![
+                    ui::field_readout(
+                        palette,
+                        "Topic prefix",
+                        self.config.mqtt.topic_prefix.clone()
+                    ),
+                    ui::field_readout(
+                        palette,
+                        "Health topic",
+                        self.config.mqtt.health_topic.clone()
+                    ),
+                    ui::field_readout(
+                        palette,
+                        "BACnet bind",
+                        self.config
+                            .bacnet
+                            .selected_interface
+                            .map(|addr| addr.to_string())
+                            .unwrap_or_else(|| "Auto / all interfaces".to_string())
+                    ),
+                ]
+                .spacing(16),
+            ]
+            .spacing(14),
+        );
+
+        let recent = ui::card(
+            palette,
+            column![
+                ui::section_title(palette, "Recent activity"),
+                self.log_preview(5),
+            ]
+            .spacing(12),
+        );
+
+        self.page_shell(
+            "Overview",
+            "Operational status, publishing health, and fast actions.",
+            column![metrics, operations, recent].spacing(16),
+        )
     }
 
     fn discover_page(&self) -> Element<'_, Message> {
-        let controls = row![
-            button("Refresh NICs").on_press(Message::RefreshInterfaces),
-            button("Discover").on_press(Message::Discover),
-            checkbox(self.config.bacnet.discover_all_interfaces)
-                .label("All interfaces")
-                .on_toggle(Message::DiscoverAllInterfacesChanged),
-            pick_list(
-                self.interface_choices.clone(),
-                self.config.bacnet.selected_interface,
-                Message::InterfaceSelected
-            )
-            .placeholder("Bind interface"),
+        let palette = self.palette();
+        let selected_bind = self
+            .config
+            .bacnet
+            .selected_interface
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "Auto".to_string());
+        let metrics = row![
+            ui::metric(
+                palette,
+                "Devices",
+                self.devices.len().to_string(),
+                format!("{} interface option(s)", self.interface_choices.len()),
+                if self.devices.is_empty() {
+                    ChipKind::Neutral
+                } else {
+                    ChipKind::Success
+                }
+            ),
+            ui::metric(
+                palette,
+                "Objects",
+                self.scanned_objects.len().to_string(),
+                "Discovered from object lists",
+                if self.scanned_objects.is_empty() {
+                    ChipKind::Neutral
+                } else {
+                    ChipKind::Accent
+                }
+            ),
+            ui::metric(
+                palette,
+                "Bind",
+                selected_bind,
+                if self.config.bacnet.discover_all_interfaces {
+                    "All interfaces enabled"
+                } else {
+                    "Single interface"
+                },
+                ChipKind::Accent
+            ),
         ]
-        .spacing(12)
-        .align_y(Alignment::Center);
+        .spacing(14);
 
-        let mut devices = column![section_title("Discovered devices")].spacing(8);
+        let scan_all_enabled = !self.devices.is_empty() && !self.working;
+        let mut scan_all_button =
+            ui::action_button(palette, Icon::Points, "Scan all", ButtonKind::Secondary);
+        if scan_all_enabled {
+            scan_all_button = scan_all_button.on_press(Message::ScanAllObjects);
+        }
+        let controls = ui::card(
+            palette,
+            column![
+                row![
+                    column![
+                        ui::section_title(palette, "Discovery command center"),
+                        ui::muted(
+                            palette,
+                            "Find devices first, then scan object lists to seed point configuration."
+                        )
+                    ]
+                    .spacing(4)
+                    .width(Length::Fill),
+                    ui::chip(
+                        palette,
+                        if self.working { "Scanning" } else { "Ready" },
+                        if self.working {
+                            ChipKind::Warning
+                        } else {
+                            ChipKind::Success
+                        }
+                    )
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+                row![
+                    ui::action_button(
+                        palette,
+                        Icon::Refresh,
+                        "Refresh NICs",
+                        ButtonKind::Secondary
+                    )
+                    .on_press(Message::RefreshInterfaces),
+                    ui::action_button(palette, Icon::Discover, "Discover", ButtonKind::Primary)
+                        .on_press(Message::Discover),
+                    scan_all_button,
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+                data_row(
+                    palette,
+                    row![
+                        checkbox(self.config.bacnet.discover_all_interfaces)
+                            .label("All interfaces")
+                            .on_toggle(Message::DiscoverAllInterfacesChanged),
+                        pick_list(
+                            self.interface_choices.clone(),
+                            self.config.bacnet.selected_interface,
+                            Message::InterfaceSelected
+                        )
+                        .placeholder("Bind interface"),
+                        ui::field_readout(
+                            palette,
+                            "Bind policy",
+                            self.settings.discovery_bind_failure_policy.to_string()
+                        ),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                ),
+            ]
+            .spacing(12),
+        );
+
+        let mut devices = column![ui::section_title(palette, "Discovered devices")].spacing(8);
         if self.devices.is_empty() {
-            devices = devices.push(text("No BACnet devices discovered yet."));
+            devices = devices.push(empty_state(
+                palette,
+                "No BACnet devices discovered yet.",
+                "Run discovery to populate reachable BACnet/IP devices.",
+            ));
         } else {
             for device in &self.devices {
-                devices = devices.push(
+                devices = devices.push(data_row(
+                    palette,
                     row![
-                        text(format!("Device {}", device.instance)).width(Length::FillPortion(2)),
-                        text(device.address.clone()).width(Length::FillPortion(2)),
-                        text(format!("Vendor {}", device.vendor_id)).width(Length::FillPortion(1)),
-                        button("Scan objects").on_press(Message::ScanObjects(device.instance)),
+                        readout(palette, "Device", format!("#{}", device.instance), 2),
+                        readout(palette, "Address", device.address.clone(), 2),
+                        readout(palette, "Vendor", format!("{}", device.vendor_id), 1),
+                        ui::action_button(
+                            palette,
+                            Icon::Points,
+                            "Scan objects",
+                            ButtonKind::Secondary
+                        )
+                        .on_press(Message::ScanObjects(device.instance)),
                     ]
                     .spacing(12)
                     .align_y(Alignment::Center),
-                );
+                ));
             }
         }
 
-        let mut objects = column![section_title("Scanned objects")].spacing(8);
+        let mut objects = column![ui::section_title(palette, "Scanned objects")].spacing(8);
         if self.scanned_objects.is_empty() {
-            objects = objects.push(text("Scan a device object list or add points manually."));
+            objects = objects.push(empty_state(
+                palette,
+                "No objects scanned yet.",
+                "Scan a device object list or add points manually.",
+            ));
         } else {
             for (index, object) in self.scanned_objects.iter().enumerate() {
-                objects = objects.push(
-                    row![
-                        text(format!("Device {}", object.device_instance))
-                            .width(Length::FillPortion(1)),
-                        text(format!("{} {}", object.object_type, object.object_instance))
-                            .width(Length::FillPortion(2)),
-                        text(self.object_summary(object)).width(Length::FillPortion(3)),
-                        button("Add point").on_press(Message::AddObjectAsPoint(index)),
+                let summary = self.object_summary(object);
+                objects = objects.push(data_row(
+                    palette,
+                    column![
+                        row![
+                            readout(
+                                palette,
+                                "Object",
+                                format!("{} {}", object.object_type, object.object_instance),
+                                2
+                            ),
+                            readout(palette, "Device", format!("#{}", object.device_instance), 1),
+                            ui::action_button(
+                                palette,
+                                Icon::Save,
+                                "Add point",
+                                ButtonKind::Primary
+                            )
+                            .on_press(Message::AddObjectAsPoint(index)),
+                        ]
+                        .spacing(12)
+                        .align_y(Alignment::Center),
+                        ui::field_readout(
+                            palette,
+                            "Preview",
+                            if summary.is_empty() {
+                                "No metadata returned".to_string()
+                            } else {
+                                summary
+                            }
+                        ),
                     ]
-                    .spacing(12)
-                    .align_y(Alignment::Center),
-                );
+                    .spacing(8),
+                ));
             }
         }
+
+        let progress: Element<'_, Message> = if let Some((current, total)) = self.scan_progress {
+            let frac = if total == 0 {
+                0.0
+            } else {
+                current as f32 / total as f32
+            };
+            ui::card(
+                palette,
+                column![
+                    text(format!(
+                        "Scanning device {} of {} ({}%)",
+                        current,
+                        total,
+                        (frac * 100.0) as u32
+                    ))
+                    .size(13)
+                    .color(palette.text),
+                    progress_bar(0.0..=1.0, frac),
+                ]
+                .spacing(8),
+            )
+        } else {
+            column![].into()
+        };
 
         self.page_shell(
             "Discover",
             "Find BACnet/IP devices and seed point configuration.",
-            column![controls, card(devices), card(objects)].spacing(16),
+            column![
+                metrics,
+                controls,
+                progress,
+                ui::card(palette, devices),
+                ui::card(palette, objects)
+            ]
+            .spacing(16),
         )
     }
 
     fn points_page(&self) -> Element<'_, Message> {
-        let editor = card(
-            column![
-                section_title(if self.selected_point.is_some() {
-                    "Edit point"
+        let palette = self.palette();
+        let point_metrics = row![
+            ui::metric(
+                palette,
+                "Configured",
+                self.config.points.len().to_string(),
+                "BACnet objects tracked",
+                ChipKind::Accent
+            ),
+            ui::metric(
+                palette,
+                "Enabled",
+                self.enabled_point_count().to_string(),
+                "Included in polling",
+                if self.enabled_point_count() == 0 {
+                    ChipKind::Warning
                 } else {
-                    "New point"
-                }),
+                    ChipKind::Success
+                }
+            ),
+            ui::metric(
+                palette,
+                "Point health",
+                match self.overall_point_kind() {
+                    ChipKind::Success => "OK",
+                    ChipKind::Warning => "Attention",
+                    ChipKind::Danger => "Error",
+                    _ => "No samples",
+                },
+                self.last_point_state(),
+                self.overall_point_kind()
+            ),
+        ]
+        .spacing(14);
+
+        let editor = ui::card(
+            palette,
+            column![
+                ui::section_title(
+                    palette,
+                    if self.selected_point.is_some() {
+                        "Edit point"
+                    } else {
+                        "New point"
+                    }
+                ),
                 row![
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "Device instance",
+                        "BACnet device id",
                         &self.point_editor.device_instance,
                         Message::PointDeviceInstanceChanged
                     ),
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "Device label",
+                        "Topic-friendly name",
                         &self.point_editor.device_label,
                         Message::PointDeviceLabelChanged
                     ),
                 ]
                 .spacing(12),
                 row![
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "Object type",
+                        "analogInput, binaryValue...",
                         &self.point_editor.object_type,
                         Message::PointObjectTypeChanged
                     ),
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "Object instance",
+                        "BACnet object id",
                         &self.point_editor.object_instance,
                         Message::PointObjectInstanceChanged
                     ),
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "Property",
+                        "presentValue by default",
                         &self.point_editor.property,
                         Message::PointPropertyChanged
                     ),
                 ]
                 .spacing(12),
                 row![
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "Tag path",
+                        "Optional MQTT path",
                         &self.point_editor.tag_path,
                         Message::PointTagPathChanged
                     ),
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "Poll seconds",
+                        "Per-point interval",
                         &self.point_editor.poll_interval_secs,
                         Message::PointPollIntervalChanged
                     ),
@@ -581,8 +959,10 @@ impl BacnetRepublisher {
                     checkbox(self.point_editor.enabled)
                         .label("Enabled")
                         .on_toggle(Message::PointEnabledChanged),
-                    button("Save point").on_press(Message::SavePoint),
-                    button("New point").on_press(Message::NewPoint),
+                    ui::action_button(palette, Icon::Save, "Save point", ButtonKind::Primary)
+                        .on_press(Message::SavePoint),
+                    ui::action_button(palette, Icon::Points, "New point", ButtonKind::Secondary)
+                        .on_press(Message::NewPoint),
                 ]
                 .spacing(12)
                 .align_y(Alignment::Center),
@@ -590,84 +970,212 @@ impl BacnetRepublisher {
             .spacing(12),
         );
 
-        let mut list = column![section_title("Configured points")].spacing(8);
+        let mut list = column![ui::section_title(palette, "Configured points")].spacing(8);
         if self.config.points.is_empty() {
-            list = list.push(text("No points configured."));
+            list = list.push(empty_state(
+                palette,
+                "No points configured.",
+                "Add points manually or seed them from a BACnet object scan.",
+            ));
         } else {
             for (index, point) in self.config.points.iter().enumerate() {
-                list = list.push(
-                    row![
-                        checkbox(point.enabled)
-                            .label("")
-                            .on_toggle(move |value| Message::TogglePoint(index, value)),
-                        text(format!("Device {}", point.device_instance))
-                            .width(Length::FillPortion(1)),
-                        text(point.display_name()).width(Length::FillPortion(2)),
-                        text(if point.tag_path.is_empty() {
-                            "(default topic)"
-                        } else {
-                            &point.tag_path
-                        })
-                        .width(Length::FillPortion(2)),
-                        text(self.point_status_label(point)).width(Length::FillPortion(2)),
-                        button("Edit").on_press(Message::EditPoint(index)),
-                        button("Delete").on_press(Message::DeletePoint(index)),
+                let (kind, label) = self.point_status_chip(point);
+                let live_value = self.live_value_text(point);
+                list = list.push(data_row(
+                    palette,
+                    column![
+                        row![
+                            checkbox(point.enabled)
+                                .label("")
+                                .on_toggle(move |value| Message::TogglePoint(index, value)),
+                            column![
+                                text(point.display_name()).size(15).color(palette.text),
+                                text(format!("Device #{}", point.device_instance))
+                                    .size(12)
+                                    .color(palette.subtle)
+                            ]
+                            .spacing(3)
+                            .width(Length::Fill),
+                            ui::chip(palette, label, kind),
+                            ui::action_button(palette, Icon::Edit, "Edit", ButtonKind::Secondary)
+                                .on_press(Message::EditPoint(index)),
+                            ui::action_button(palette, Icon::Delete, "Delete", ButtonKind::Danger)
+                                .on_press(Message::DeletePoint(index)),
+                        ]
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                        row![
+                            readout(
+                                palette,
+                                "Topic path",
+                                if point.tag_path.is_empty() {
+                                    "(default topic)"
+                                } else {
+                                    &point.tag_path
+                                },
+                                3
+                            ),
+                            readout(palette, "Live value", live_value, 1),
+                            readout(
+                                palette,
+                                "Poll interval",
+                                format!("{}s", point.poll_interval_secs),
+                                1
+                            ),
+                        ]
+                        .spacing(12)
+                        .align_y(Alignment::Center),
                     ]
-                    .spacing(10)
-                    .align_y(Alignment::Center),
-                );
+                    .spacing(10),
+                ));
             }
         }
 
         self.page_shell(
             "Points",
             "Manage BACnet objects and MQTT tag paths.",
-            column![editor, card(list)].spacing(16),
+            column![point_metrics, editor, ui::card(palette, list)].spacing(16),
         )
     }
 
     fn republish_page(&self) -> Element<'_, Message> {
-        let mut samples = column![section_title("Last samples")].spacing(8);
+        let palette = self.palette();
+        let publish_metrics = row![
+            ui::metric(
+                palette,
+                "Mode",
+                if self.republishing {
+                    "Running"
+                } else {
+                    "Manual"
+                },
+                if self.republishing {
+                    "Continuous republisher active"
+                } else {
+                    "Poll once or start loop"
+                },
+                if self.republishing {
+                    ChipKind::Success
+                } else {
+                    ChipKind::Accent
+                }
+            ),
+            ui::metric(
+                palette,
+                "Enabled points",
+                self.enabled_point_count().to_string(),
+                "Eligible for MQTT publish",
+                if self.enabled_point_count() == 0 {
+                    ChipKind::Warning
+                } else {
+                    ChipKind::Success
+                }
+            ),
+            ui::metric(
+                palette,
+                "Samples",
+                self.samples.len().to_string(),
+                self.last_point_state(),
+                self.overall_point_kind()
+            ),
+        ]
+        .spacing(14);
+
+        let mut samples = column![ui::section_title(palette, "Last samples")].spacing(8);
         if self.samples.is_empty() {
-            samples = samples.push(text("No point samples published yet."));
+            samples = samples.push(empty_state(
+                palette,
+                "No point samples published yet.",
+                "Use Discover → Scan all to seed points, then poll or start the republisher.",
+            ));
         } else {
             for sample in self.samples.iter().rev().take(20) {
-                samples = samples.push(
+                samples = samples.push(data_row(
+                    palette,
                     row![
-                        text(sample.topic.clone()).width(Length::FillPortion(3)),
-                        text(sample.value.to_string()).width(Length::FillPortion(1)),
-                        text(sample.timestamp_ms.to_string()).width(Length::FillPortion(1)),
+                        readout(palette, "Topic", sample.topic.clone(), 3),
+                        readout(palette, "Value", sample.value.to_string(), 1),
+                        readout(palette, "Sampled", format_timestamp(sample.timestamp_ms), 1),
                     ]
-                    .spacing(12),
-                );
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                ));
             }
         }
 
-        let summary = card(
+        let summary = ui::card(
+            palette,
             column![
-                section_title("MQTT target"),
-                text(format!(
-                    "{}:{} ({})",
-                    self.config.mqtt.host,
-                    self.config.mqtt.port,
-                    if self.config.mqtt.use_tls {
-                        "TLS"
-                    } else {
-                        "plain TCP"
-                    }
-                )),
-                text(format!("Topic prefix: {}", self.config.mqtt.topic_prefix)),
-                text(format!("Health topic: {}", self.config.mqtt.health_topic)),
                 row![
-                    button("Poll once").on_press(Message::PollAndPublish),
-                    button(if self.republishing {
-                        "Republishing"
-                    } else {
-                        "Start"
-                    })
+                    ui::section_title(palette, "MQTT target"),
+                    ui::chip(
+                        palette,
+                        if self.republishing {
+                            "Publishing"
+                        } else {
+                            "Idle"
+                        },
+                        if self.republishing {
+                            ChipKind::Success
+                        } else {
+                            ChipKind::Neutral
+                        }
+                    )
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+                row![
+                    ui::field_readout(
+                        palette,
+                        "Endpoint",
+                        format!(
+                            "{}:{} ({})",
+                            self.config.mqtt.host,
+                            self.config.mqtt.port,
+                            if self.config.mqtt.use_tls {
+                                "TLS"
+                            } else {
+                                "plain TCP"
+                            }
+                        )
+                    ),
+                    ui::field_readout(
+                        palette,
+                        "Topic prefix",
+                        self.config.mqtt.topic_prefix.clone()
+                    ),
+                    ui::field_readout(
+                        palette,
+                        "Health topic",
+                        self.config.mqtt.health_topic.clone()
+                    ),
+                ]
+                .spacing(16),
+                row![
+                    ui::action_button(palette, Icon::Publish, "Poll once", ButtonKind::Secondary)
+                        .on_press(Message::PollAndPublish),
+                    ui::action_button(
+                        palette,
+                        Icon::Start,
+                        if self.republishing {
+                            "Republishing"
+                        } else {
+                            "Start"
+                        },
+                        ButtonKind::Secondary
+                    )
                     .on_press(Message::StartRepublisher),
-                    button("Stop").on_press(Message::StopRepublisher),
-                    text(format!("{} enabled point(s)", self.enabled_point_count())),
+                    ui::action_button(palette, Icon::Stop, "Stop", ButtonKind::Danger)
+                        .on_press(Message::StopRepublisher),
+                    ui::chip(
+                        palette,
+                        format!("{} enabled point(s)", self.enabled_point_count()),
+                        if self.enabled_point_count() > 0 {
+                            ChipKind::Accent
+                        } else {
+                            ChipKind::Warning
+                        }
+                    ),
                 ]
                 .spacing(12)
                 .align_y(Alignment::Center),
@@ -678,129 +1186,253 @@ impl BacnetRepublisher {
         self.page_shell(
             "Republish",
             "Poll configured BACnet points and publish scalar MQTT values.",
-            column![summary, card(samples)].spacing(16),
+            column![publish_metrics, summary, ui::card(palette, samples)].spacing(16),
         )
     }
 
     fn settings_page(&self) -> Element<'_, Message> {
-        let bacnet = card(
+        let palette = self.palette();
+        let settings_summary = ui::card(
+            palette,
             column![
-                section_title("BACnet/IP"),
                 row![
-                    labeled_input(
+                    column![
+                        ui::section_title(palette, "Configuration summary"),
+                        ui::muted(
+                            palette,
+                            "Review transport defaults, save local preferences, and keep secrets opt-in."
+                        )
+                    ]
+                    .spacing(4)
+                    .width(Length::Fill),
+                    ui::action_button(palette, Icon::Save, "Save settings", ButtonKind::Primary)
+                        .on_press(Message::SaveSettings),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+                row![
+                    ui::field_readout(
+                        palette,
+                        "MQTT endpoint",
+                        format!(
+                            "{}:{} ({})",
+                            self.settings.mqtt_host,
+                            self.settings.mqtt_port,
+                            if self.settings.mqtt_use_tls {
+                                "TLS"
+                            } else {
+                                "plain TCP"
+                            }
+                        )
+                    ),
+                    ui::field_readout(
+                        palette,
+                        "BACnet discovery",
+                        format!(
+                            "{} ms window · {}",
+                            self.settings.discovery_window_ms,
+                            self.settings.discovery_bind_failure_policy
+                        )
+                    ),
+                    ui::field_readout(
+                        palette,
+                        "Secrets",
+                        if self.settings.mqtt_remember_secrets {
+                            "Remembered locally"
+                        } else {
+                            "Not persisted"
+                        }
+                    ),
+                ]
+                .spacing(16),
+            ]
+            .spacing(14),
+        );
+
+        let bacnet = ui::card(
+            palette,
+            column![
+                ui::section_title(palette, "BACnet/IP"),
+                row![
+                    ui::labeled_input(
+                        palette,
                         "Port",
+                        "Default 47808",
                         &self.settings.bacnet_port,
                         Message::BacnetPortChanged
                     ),
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "Broadcast address",
+                        "Usually 255.255.255.255",
                         &self.settings.broadcast_address,
                         Message::BroadcastAddressChanged
                     ),
                 ]
                 .spacing(12),
                 row![
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "Discovery window ms",
+                        "Minimum 250 ms",
                         &self.settings.discovery_window_ms,
                         Message::DiscoveryWindowChanged
                     ),
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "APDU timeout ms",
+                        "Minimum 250 ms",
                         &self.settings.apdu_timeout_ms,
                         Message::ApduTimeoutChanged
                     ),
                 ]
                 .spacing(12),
+                row![
+                    ui::field_readout(
+                        palette,
+                        "Discovery bind errors",
+                        "When scanning multiple interfaces"
+                    ),
+                    pick_list(
+                        DiscoveryBindFailurePolicy::ALL.to_vec(),
+                        Some(self.settings.discovery_bind_failure_policy),
+                        Message::DiscoveryBindFailurePolicySelected
+                    ),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
                 checkbox(self.settings.bbmd_enabled)
                     .label("Register as foreign device through BBMD")
                     .on_toggle(Message::BbmdEnabledChanged),
                 row![
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "BBMD address",
+                        "Foreign device target",
                         &self.settings.bbmd_address,
                         Message::BbmdAddressChanged
                     ),
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "BBMD port",
+                        "Usually 47808",
                         &self.settings.bbmd_port,
                         Message::BbmdPortChanged
                     ),
-                    labeled_input("BBMD TTL", &self.settings.bbmd_ttl, Message::BbmdTtlChanged),
+                    ui::labeled_input(
+                        palette,
+                        "BBMD TTL",
+                        "Seconds",
+                        &self.settings.bbmd_ttl,
+                        Message::BbmdTtlChanged
+                    ),
                 ]
                 .spacing(12),
             ]
             .spacing(12),
         );
 
-        let mqtt = card(
+        let mqtt = ui::card(
+            palette,
             column![
-                section_title("MQTT"),
+                ui::section_title(palette, "MQTT"),
                 row![
-                    labeled_input("Host", &self.settings.mqtt_host, Message::MqttHostChanged),
-                    labeled_input("Port", &self.settings.mqtt_port, Message::MqttPortChanged),
+                    ui::labeled_input(
+                        palette,
+                        "Host",
+                        "Broker hostname or IP",
+                        &self.settings.mqtt_host,
+                        Message::MqttHostChanged
+                    ),
+                    ui::labeled_input(
+                        palette,
+                        "Port",
+                        "8883 TLS / 1883 plain",
+                        &self.settings.mqtt_port,
+                        Message::MqttPortChanged
+                    ),
                 ]
                 .spacing(12),
                 row![
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "Client ID",
+                        "MQTT client identifier",
                         &self.settings.mqtt_client_id,
                         Message::MqttClientIdChanged
                     ),
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "Keep-alive seconds",
+                        "Broker heartbeat",
                         &self.settings.mqtt_keep_alive_secs,
                         Message::MqttKeepAliveChanged
                     ),
                 ]
                 .spacing(12),
                 row![
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "Topic prefix",
+                        "Telemetry root",
                         &self.settings.mqtt_topic_prefix,
                         Message::MqttTopicPrefixChanged
                     ),
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "Health topic",
+                        "Republisher heartbeat",
                         &self.settings.mqtt_health_topic,
                         Message::MqttHealthTopicChanged
                     ),
                 ]
                 .spacing(12),
                 row![
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "Username",
+                        "Optional broker user",
                         &self.settings.mqtt_username,
                         Message::MqttUsernameChanged
                     ),
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "Password",
+                        "Saved only if enabled below",
                         &self.settings.mqtt_password,
                         Message::MqttPasswordChanged
                     ),
                 ]
                 .spacing(12),
                 row![
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "CA certificate PEM",
+                        "Optional trust anchor",
                         &self.settings.mqtt_ca_cert_path,
                         Message::MqttCaCertPathChanged
                     ),
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "Client certificate PEM",
+                        "Mutual TLS certificate",
                         &self.settings.mqtt_client_cert_path,
                         Message::MqttClientCertPathChanged
                     ),
                 ]
                 .spacing(12),
                 row![
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "Client key PEM",
+                        "Required with client cert",
                         &self.settings.mqtt_client_key_path,
                         Message::MqttClientKeyPathChanged
                     ),
-                    labeled_input(
+                    ui::labeled_input(
+                        palette,
                         "Client key passphrase",
+                        "Saved only if enabled below",
                         &self.settings.mqtt_client_key_passphrase,
                         Message::MqttClientKeyPassphraseChanged
                     ),
@@ -822,15 +1454,17 @@ impl BacnetRepublisher {
             .spacing(12),
         );
 
-        let ui = card(
+        let ui_panel = ui::card(
+            palette,
             row![
-                text("Theme").width(Length::Fixed(120.0)),
+                ui::field_readout(palette, "Theme", "Local operator preference"),
                 pick_list(
                     UiTheme::ALL.to_vec(),
                     Some(self.config.ui.theme),
                     Message::ThemeSelected
                 ),
-                button("Save settings").on_press(Message::SaveSettings),
+                ui::action_button(palette, Icon::Save, "Save settings", ButtonKind::Primary)
+                    .on_press(Message::SaveSettings),
             ]
             .spacing(12)
             .align_y(Alignment::Center),
@@ -839,33 +1473,71 @@ impl BacnetRepublisher {
         self.page_shell(
             "Settings",
             "Configure BACnet transport, MQTT destination, and local preferences.",
-            column![bacnet, mqtt, ui].spacing(16),
+            column![settings_summary, bacnet, mqtt, ui_panel].spacing(16),
         )
     }
 
     fn logs_page(&self) -> Element<'_, Message> {
+        let palette = self.palette();
+        let newest_log = self
+            .logs
+            .entries()
+            .back()
+            .map(|entry| format!("+{}s", entry.elapsed.as_secs()))
+            .unwrap_or_else(|| "None".to_string());
+        let log_metrics = row![
+            ui::metric(
+                palette,
+                "Entries",
+                self.logs.entries().len().to_string(),
+                "Buffered app events",
+                ChipKind::Accent
+            ),
+            ui::metric(
+                palette,
+                "Latest",
+                newest_log,
+                "Since app launch",
+                ChipKind::Neutral
+            ),
+            ui::metric(
+                palette,
+                "Status",
+                match self.status_chip_kind() {
+                    ChipKind::Success => "OK",
+                    ChipKind::Warning => "Attention",
+                    ChipKind::Danger => "Error",
+                    _ => "Info",
+                },
+                self.status.clone(),
+                self.status_chip_kind()
+            ),
+        ]
+        .spacing(14);
+
         let mut log_list = column![].spacing(6);
         for entry in self.logs.entries() {
-            log_list = log_list.push(text(format!(
-                "#{:04} +{:>5}s [{}] {}",
+            log_list = log_list.push(self.log_row(
                 entry.sequence,
                 entry.elapsed.as_secs(),
                 entry.level,
-                entry.message
-            )));
+                &entry.message,
+            ));
         }
 
         self.page_shell(
             "Logs",
             "Recent app, BACnet, and MQTT activity.",
             column![
+                log_metrics,
                 row![
-                    button("Clear logs").on_press(Message::ClearLogs),
-                    text(self.status.clone())
+                    ui::action_button(palette, Icon::Delete, "Clear logs", ButtonKind::Danger)
+                        .on_press(Message::ClearLogs),
+                    ui::chip(palette, self.status.clone(), self.status_chip_kind())
                 ]
                 .spacing(12)
                 .align_y(Alignment::Center),
-                card(log_list)
+                ui::card(palette, log_list)
             ]
             .spacing(16),
         )
@@ -877,7 +1549,27 @@ impl BacnetRepublisher {
         subtitle: &'a str,
         body: Column<'a, Message>,
     ) -> Element<'a, Message> {
-        let header = column![text(title).size(30), text(subtitle).size(15)].spacing(4);
+        let palette = self.palette();
+        let header = row![
+            column![
+                ui::eyebrow(palette, "BACNET REPUBLISHER"),
+                text(title).size(30).color(palette.text),
+                text(subtitle).size(15).color(palette.muted)
+            ]
+            .spacing(4)
+            .width(Length::Fill),
+            ui::chip(
+                palette,
+                if self.working { "Working" } else { "Ready" },
+                if self.working {
+                    ChipKind::Warning
+                } else {
+                    ChipKind::Success
+                }
+            )
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center);
         container(scrollable(column![header, body].spacing(18).padding(24)))
             .width(Length::Fill)
             .height(Length::Fill)
@@ -885,15 +1577,15 @@ impl BacnetRepublisher {
     }
 
     fn nav_button(&self, page: Page) -> Element<'_, Message> {
-        let label = if self.selected_page == page {
-            format!("> {page}")
-        } else {
-            format!("  {page}")
-        };
-        button(text(label).width(Length::Fill))
-            .width(Length::Fill)
-            .on_press(Message::SelectPage(page))
-            .into()
+        let palette = self.palette();
+        ui::nav_button(
+            palette,
+            page_icon(page),
+            page.to_string(),
+            self.selected_page == page,
+        )
+        .on_press(Message::SelectPage(page))
+        .into()
     }
 
     fn start_discovery(&mut self) {
@@ -913,11 +1605,46 @@ impl BacnetRepublisher {
         spawn_object_scan(
             self.worker_sender.clone(),
             self.config.bacnet.clone(),
+            self.interfaces.clone(),
             device_instance,
         );
     }
 
+    fn start_scan_all_objects(&mut self) {
+        if self.working {
+            self.set_status(
+                LogLevel::Warning,
+                "Another BACnet operation is already running",
+            );
+            return;
+        }
+        if self.devices.is_empty() {
+            self.set_status(
+                LogLevel::Warning,
+                "Discover devices before scanning all object lists",
+            );
+            return;
+        }
+        self.working = true;
+        self.scanned_objects.clear();
+        self.scan_progress = Some((0, self.devices.len()));
+        spawn_scan_all_objects(
+            self.worker_sender.clone(),
+            self.config.bacnet.clone(),
+            self.interfaces.clone(),
+            self.devices.clone(),
+            self.config.points.clone(),
+        );
+    }
+
     fn start_poll_and_publish(&mut self) {
+        if self.republishing {
+            self.set_status(
+                LogLevel::Warning,
+                "Stop the continuous republisher before running Poll once",
+            );
+            return;
+        }
         if let Err(error) = self.config.validate() {
             self.set_status(LogLevel::Error, error);
             return;
@@ -933,6 +1660,7 @@ impl BacnetRepublisher {
         spawn_poll_and_publish(
             self.worker_sender.clone(),
             self.config.bacnet.clone(),
+            self.interfaces.clone(),
             self.config.mqtt.clone(),
             self.config.points.clone(),
         );
@@ -964,6 +1692,7 @@ impl BacnetRepublisher {
         spawn_republisher(
             self.worker_sender.clone(),
             self.config.bacnet.clone(),
+            self.interfaces.clone(),
             self.config.mqtt.clone(),
             self.config.points.clone(),
             stop,
@@ -985,7 +1714,7 @@ impl BacnetRepublisher {
         let Some(object) = self.scanned_objects.get(index) else {
             return;
         };
-        let point = point_from_object(object);
+        let point = point_from_object(object, None);
         self.point_editor = PointEditor::from_point(&point);
         self.selected_point = None;
         self.selected_page = Page::Points;
@@ -1054,6 +1783,15 @@ impl BacnetRepublisher {
                 WorkerEvent::Log(level, message) => self.set_status(level, message),
                 WorkerEvent::Devices(devices) => self.devices = devices,
                 WorkerEvent::Objects(objects) => self.scanned_objects = objects,
+                WorkerEvent::ScanProgress { current, total } => {
+                    self.scan_progress = Some((current, total));
+                }
+                WorkerEvent::BulkTagImport(outcome) => {
+                    self.devices = outcome.devices;
+                    self.scanned_objects = outcome.scanned_objects;
+                    self.config.points = outcome.points;
+                    self.save_config_with_status();
+                }
                 WorkerEvent::Samples(samples) => self.record_samples(samples),
                 WorkerEvent::Failures(failures) => {
                     for failure in failures {
@@ -1093,6 +1831,7 @@ impl BacnetRepublisher {
                 }
                 WorkerEvent::Finished(message) => {
                     self.working = false;
+                    self.scan_progress = None;
                     if message.contains("republisher stopped") {
                         self.republishing = false;
                         self.republisher_stop = None;
@@ -1113,21 +1852,69 @@ impl BacnetRepublisher {
         self.samples = samples;
     }
 
-    fn point_status_label(&self, point: &PointConfig) -> String {
+    fn live_value_text(&self, point: &PointConfig) -> String {
         let Some(status) = self.point_statuses.get(&PointIdentity::from_point(point)) else {
-            return "No sample".to_string();
+            return "—".to_string();
         };
-        if let Some(error) = &status.last_error {
-            return format!("Stale: {error}");
+        match &status.last_value {
+            Some(value) => value.to_string(),
+            None => "—".to_string(),
         }
-        if let Some(error) = &status.last_publish_error {
-            return format!("Publish error: {error}");
+    }
+
+    fn point_status_chip(&self, point: &PointConfig) -> (ChipKind, String) {
+        let Some(status) = self.point_statuses.get(&PointIdentity::from_point(point)) else {
+            return (ChipKind::Neutral, "No sample".to_string());
+        };
+        if status.last_error.is_some() {
+            return (ChipKind::Danger, "Read error".to_string());
         }
-        match (&status.last_value, status.last_sample_ms) {
-            (Some(value), Some(timestamp)) => format!("OK {value} @ {timestamp}"),
-            (Some(value), None) => format!("OK {value}"),
-            _ if status.stale => "Stale".to_string(),
-            _ => "OK".to_string(),
+        if status.last_publish_error.is_some() {
+            return (ChipKind::Warning, "Publish error".to_string());
+        }
+        if status.stale {
+            return (ChipKind::Warning, "Stale".to_string());
+        }
+        if let Some(timestamp) = status.last_sample_ms {
+            return (
+                ChipKind::Success,
+                format!("OK {}", format_timestamp(timestamp)),
+            );
+        }
+        (ChipKind::Success, "OK".to_string())
+    }
+
+    fn overall_point_kind(&self) -> ChipKind {
+        if self
+            .point_statuses
+            .values()
+            .any(|status| status.last_error.is_some())
+        {
+            ChipKind::Danger
+        } else if self
+            .point_statuses
+            .values()
+            .any(|status| status.stale || status.last_publish_error.is_some())
+        {
+            ChipKind::Warning
+        } else if self.samples.is_empty() {
+            ChipKind::Neutral
+        } else {
+            ChipKind::Success
+        }
+    }
+
+    fn last_point_state(&self) -> String {
+        if let Some(sample) = self.samples.last() {
+            format!(
+                "{} at {}",
+                sample.value,
+                format_timestamp(sample.timestamp_ms)
+            )
+        } else if self.point_statuses.is_empty() {
+            "No samples recorded".to_string()
+        } else {
+            format!("{} tracked point state(s)", self.point_statuses.len())
         }
     }
 
@@ -1162,93 +1949,209 @@ impl BacnetRepublisher {
         self.logs.push(level, message);
     }
 
-    fn palette(&self) -> Palette {
-        match self.config.ui.theme {
-            UiTheme::Light => Palette {
-                background: Color::from_rgb8(244, 247, 248),
-                panel: Color::WHITE,
-                card: Color::from_rgb8(252, 253, 253),
-                text: Color::from_rgb8(27, 32, 35),
-                border: Color::from_rgb8(214, 222, 226),
-            },
-            UiTheme::Auto | UiTheme::Dark => Palette {
-                background: Color::from_rgb8(18, 22, 24),
-                panel: Color::from_rgb8(26, 32, 35),
-                card: Color::from_rgb8(31, 38, 41),
-                text: Color::from_rgb8(232, 238, 241),
-                border: Color::from_rgb8(58, 70, 75),
-            },
+    fn status_bar(&self) -> Element<'_, Message> {
+        let palette = self.palette();
+        container(
+            row![
+                ui::chip(palette, self.status.clone(), self.status_chip_kind()),
+                text(format!(
+                    "{} pts · {} devices",
+                    self.config.points.len(),
+                    self.devices.len()
+                ))
+                .size(13)
+                .color(palette.muted)
+                .width(Length::Fill),
+                text(format!(
+                    "Config: {}",
+                    compact_config_path(&self.config_path)
+                ))
+                .size(12)
+                .color(palette.subtle),
+            ]
+            .spacing(14)
+            .padding(12)
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .style(move |_| ui::status_bar_style(palette))
+        .into()
+    }
+
+    fn log_preview(&self, take: usize) -> Element<'_, Message> {
+        let palette = self.palette();
+        let mut logs = column![].spacing(6);
+        if self.logs.entries().is_empty() {
+            logs = logs.push(empty_state(
+                palette,
+                "No activity yet.",
+                "App, BACnet, and MQTT events will appear here.",
+            ));
+        } else {
+            for entry in self.logs.entries().iter().rev().take(take) {
+                logs = logs.push(self.log_row(
+                    entry.sequence,
+                    entry.elapsed.as_secs(),
+                    entry.level,
+                    &entry.message,
+                ));
+            }
         }
+        logs.into()
+    }
+
+    fn log_row<'a>(
+        &'a self,
+        sequence: u64,
+        elapsed_secs: u64,
+        level: LogLevel,
+        message: &'a str,
+    ) -> Element<'a, Message> {
+        let palette = self.palette();
+        data_row(
+            palette,
+            row![
+                ui::chip(
+                    palette,
+                    level.to_string(),
+                    match level {
+                        LogLevel::Info => ChipKind::Accent,
+                        LogLevel::Warning => ChipKind::Warning,
+                        LogLevel::Error => ChipKind::Danger,
+                    }
+                ),
+                text(format!("#{:04}", sequence))
+                    .size(12)
+                    .color(palette.subtle),
+                text(format!("+{}s", elapsed_secs))
+                    .size(12)
+                    .color(palette.subtle),
+                text(message.to_string())
+                    .size(13)
+                    .color(palette.text)
+                    .width(Length::Fill),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+    }
+
+    fn status_chip_kind(&self) -> ChipKind {
+        let lower = self.status.to_ascii_lowercase();
+        if lower.contains("error") || lower.contains("failed") || lower.contains("cannot") {
+            ChipKind::Danger
+        } else if lower.contains("warning")
+            || lower.contains("stale")
+            || lower.contains("stopping")
+            || lower.contains("enable at least")
+        {
+            ChipKind::Warning
+        } else if lower.contains("saved")
+            || lower.contains("complete")
+            || lower.contains("loaded")
+            || lower.contains("ready")
+        {
+            ChipKind::Success
+        } else {
+            ChipKind::Accent
+        }
+    }
+
+    fn palette(&self) -> ui::Palette {
+        ui::palette(self.config.ui.theme)
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Palette {
-    background: Color,
-    panel: Color,
-    card: Color,
-    text: Color,
-    border: Color,
-}
-
-fn section_title(label: &str) -> Element<'_, Message> {
-    text(label).size(18).into()
-}
-
-fn labeled_input<'a>(
-    label: &'a str,
-    value: &'a str,
-    on_input: impl Fn(String) -> Message + 'a,
+fn readout<'a>(
+    palette: ui::Palette,
+    label: impl Into<String>,
+    value: impl Into<String>,
+    portion: u16,
 ) -> Element<'a, Message> {
-    column![
-        text(label).size(13),
-        text_input(label, value)
-            .on_input(on_input)
-            .padding(8)
-            .width(Length::Fill),
-    ]
-    .spacing(4)
-    .width(Length::Fill)
-    .into()
-}
-
-fn card<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    container(content)
-        .padding(16)
-        .width(Length::Fill)
-        .style(|theme: &Theme| {
-            let palette = match theme {
-                Theme::Light => Palette {
-                    background: Color::from_rgb8(244, 247, 248),
-                    panel: Color::WHITE,
-                    card: Color::from_rgb8(252, 253, 253),
-                    text: Color::BLACK,
-                    border: Color::from_rgb8(214, 222, 226),
-                },
-                _ => Palette {
-                    background: Color::from_rgb8(18, 22, 24),
-                    panel: Color::from_rgb8(26, 32, 35),
-                    card: Color::from_rgb8(31, 38, 41),
-                    text: Color::WHITE,
-                    border: Color::from_rgb8(58, 70, 75),
-                },
-            };
-            container_style(palette.card, palette.border)
-        })
+    container(ui::field_readout(palette, label, value))
+        .width(Length::FillPortion(portion))
         .into()
 }
 
-fn container_style(background: Color, border: Color) -> iced::widget::container::Style {
-    iced::widget::container::Style {
-        text_color: None,
-        background: Some(Background::Color(background)),
-        border: Border {
-            color: border,
-            width: 1.0,
-            radius: 8.0.into(),
-        },
-        shadow: Shadow::default(),
-        snap: false,
+fn data_row<'a>(
+    palette: ui::Palette,
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    container(content)
+        .padding(12)
+        .width(Length::Fill)
+        .style(move |_| ui::row_style(palette))
+        .into()
+}
+
+fn empty_state<'a>(
+    palette: ui::Palette,
+    title: impl Into<String>,
+    detail: impl Into<String>,
+) -> Element<'a, Message> {
+    container(
+        column![
+            text(title.into()).size(15).color(palette.text),
+            text(detail.into()).size(13).color(palette.muted)
+        ]
+        .spacing(4),
+    )
+    .padding(14)
+    .width(Length::Fill)
+    .style(move |_| ui::row_style(palette))
+    .into()
+}
+
+fn page_icon(page: Page) -> Icon {
+    match page {
+        Page::Overview => Icon::Overview,
+        Page::Discover => Icon::Discover,
+        Page::Points => Icon::Points,
+        Page::Republish => Icon::Publish,
+        Page::Settings => Icon::Settings,
+        Page::Logs => Icon::Logs,
+    }
+}
+
+fn initial_page() -> Page {
+    let Ok(value) = std::env::var("BACNET_REPUBLISHER_INITIAL_PAGE") else {
+        return Page::Overview;
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "discover" => Page::Discover,
+        "points" => Page::Points,
+        "republish" | "publish" => Page::Republish,
+        "settings" => Page::Settings,
+        "logs" => Page::Logs,
+        _ => Page::Overview,
+    }
+}
+
+fn format_timestamp(timestamp_ms: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(timestamp_ms)
+        .map(|timestamp| {
+            timestamp
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| timestamp_ms.to_string())
+}
+
+fn compact_config_path(path: &Path) -> String {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("config.toml");
+    let parent_name = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|value| value.to_str());
+
+    match parent_name {
+        Some(parent) => format!("{parent}/{file_name}"),
+        None => file_name.to_string(),
     }
 }
 

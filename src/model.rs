@@ -99,6 +99,22 @@ pub struct PollOutcome {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoverOutcome {
+    pub devices: Vec<DiscoveredDevice>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BulkTagImportOutcome {
+    pub devices: Vec<DiscoveredDevice>,
+    pub scanned_objects: Vec<DeviceObject>,
+    pub points: Vec<PointConfig>,
+    pub added: usize,
+    pub updated: usize,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TelemetryValue {
     Number(f64),
