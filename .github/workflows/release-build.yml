@@ -1,0 +1,115 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Build signed Windows executable
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup component add rustfmt clippy --toolchain stable
+          rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release
+        run: cargo build --locked --release
+
+      - name: Decode signing certificate
+        shell: pwsh
+        run: |
+          $certBytes = [Convert]::FromBase64String("${{ secrets.WINDOWS_CODESIGN_CERT_BASE64 }}")
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\codesign" | Out-Null
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\codesign\codesign.pfx", $certBytes)
+
+      - name: Sign executable
+        shell: pwsh
+        env:
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_CERT_PASSWORD }}
+          TIMESTAMP_URL: ${{ vars.WINDOWS_CODESIGN_TIMESTAMP_URL || 'http://timestamp.digicert.com' }}
+        run: |
+          $exe = "$env:GITHUB_WORKSPACE\target\release\bacnet-republisher.exe"
+          $pfx = "$env:RUNNER_TEMP\codesign\codesign.pfx"
+          $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match "\\x64\\signtool.exe$" } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1).FullName
+          if (-not $signtool) { throw "signtool.exe not found" }
+          & $signtool sign /f $pfx /p $env:CERT_PASSWORD /fd SHA256 /tr $env:TIMESTAMP_URL /td SHA256 /v $exe
+          if ($LASTEXITCODE -ne 0) { throw "SignTool failed with exit code $LASTEXITCODE" }
+
+      - name: Verify signature
+        shell: pwsh
+        run: |
+          $exe = "$env:GITHUB_WORKSPACE\target\release\bacnet-republisher.exe"
+          $signature = Get-AuthenticodeSignature $exe
+          $signature | Format-List
+          if ($signature.Status -ne "Valid") {
+            throw "Authenticode signature status is $($signature.Status)"
+          }
+
+      - name: Package signed executable
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $package = "bacnet-republisher-$tag-windows-x86_64"
+          $packageDir = Join-Path "dist" $package
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          Copy-Item "target\release\bacnet-republisher.exe" $packageDir
+          Copy-Item "README.md" $packageDir
+          Compress-Archive -Path (Join-Path $packageDir "*") -DestinationPath "dist\$package.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: bacnet-republisher-windows-x86_64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: windows
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist/artifacts
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if ! gh release view "${tag}" >/dev/null 2>&1; then
+            gh release create "${tag}" --title "${tag}" --notes "Automated release build for ${tag}"
+          fi
+          mapfile -d '' files < <(find dist/artifacts -name '*.zip' -print0)
+          gh release upload "${tag}" "${files[@]}" --clobber

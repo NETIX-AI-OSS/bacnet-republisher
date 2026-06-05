@@ -1,0 +1,32 @@
+[package]
+name = "bacnet-republisher"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+description = "Native BACnet/IP discovery and MQTT republishing utility for NETIX"
+
+[dependencies]
+anyhow = "1.0"
+bacnet-client = "0.9.0"
+bacnet-services = "0.9.0"
+bacnet-transport = "0.9.0"
+bacnet-types = "0.9.0"
+bytes = "1.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+crossbeam-channel = "0.5"
+directories = "6.0"
+get_if_addrs = "0.5"
+iced = { version = "0.14", features = ["tokio"] }
+rumqttc = "0.25.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.48", features = ["rt-multi-thread", "time"] }
+toml = "0.9"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
