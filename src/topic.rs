@@ -1,6 +1,23 @@
 use crate::config::MqttConfig;
 use crate::model::PointConfig;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopicError {
+    Empty,
+    Wildcard,
+}
+
+impl std::fmt::Display for TopicError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("MQTT publish topic cannot be empty"),
+            Self::Wildcard => formatter.write_str("MQTT publish topic cannot contain # or +"),
+        }
+    }
+}
+
+impl std::error::Error for TopicError {}
+
 pub fn telemetry_topic(config: &MqttConfig, point: &PointConfig) -> String {
     let tag_path = if point.tag_path.trim().is_empty() {
         default_tag_path(point)
@@ -17,12 +34,23 @@ pub fn default_tag_path(point: &PointConfig) -> String {
         point.device_label.clone()
     };
     format!(
-        "{}/{}/{}/{}",
+        "{}/{}_{}/{}",
         sanitize_segment(&device),
         sanitize_segment(&point.object_type),
         point.object_instance,
         sanitize_segment(&point.property)
     )
+}
+
+pub fn validate_publish_topic(topic: &str) -> Result<(), TopicError> {
+    let trimmed = topic.trim();
+    if trimmed.is_empty() {
+        return Err(TopicError::Empty);
+    }
+    if trimmed.contains('#') || trimmed.contains('+') {
+        return Err(TopicError::Wildcard);
+    }
+    Ok(())
 }
 
 pub fn normalize_prefix(prefix: &str) -> String {
@@ -92,7 +120,7 @@ mod tests {
 
         assert_eq!(
             telemetry_topic(&config, &point),
-            "Netix/NC-9/Jace_Neo/analog_input/2/present_value"
+            "Netix/NC-9/Jace_Neo/analog_input_2/present_value"
         );
     }
 
@@ -108,5 +136,15 @@ mod tests {
             telemetry_topic(&config, &point),
             "Netix/Site/AHU1/Supply_Temp"
         );
+    }
+
+    #[test]
+    fn publish_topic_validation_rejects_wildcards() {
+        assert!(validate_publish_topic("Netix/Site/AHU1/temp").is_ok());
+        assert_eq!(
+            validate_publish_topic("Netix/Site/#").unwrap_err(),
+            TopicError::Wildcard
+        );
+        assert_eq!(validate_publish_topic("").unwrap_err(), TopicError::Empty);
     }
 }

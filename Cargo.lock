@@ -320,6 +320,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bacnet-client",
+ "bacnet-encoding",
+ "bacnet-network",
  "bacnet-services",
  "bacnet-transport",
  "bacnet-types",
@@ -330,6 +332,8 @@ dependencies = [
  "get_if_addrs",
  "iced",
  "rumqttc",
+ "rustls-native-certs",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "tempfile",

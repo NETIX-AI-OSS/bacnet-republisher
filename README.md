@@ -5,9 +5,11 @@ Native Rust desktop utility for discovering BACnet/IP devices, polling BACnet po
 ## Features
 
 - Active BACnet/IP discovery with Who-Is/I-Am.
-- Device object-list scan where controllers expose `objectList`.
+- Device object-list scan where controllers expose `objectList`, with best-effort metadata preview.
 - Manual point entry for constrained controllers.
 - MQTT/TLS republishing with scalar payloads compatible with NETIX abstract MQTT ingestion.
+- Optional PEM-based MQTT TLS CA, client certificate, and client key paths.
+- Per-point stale/read/publish status in the app.
 - Local TOML configuration with opt-in secret persistence.
 - GitHub Actions CI and signed Windows release packaging.
 
@@ -22,6 +24,8 @@ Telemetry publishes one scalar value per MQTT topic:
 By default the prefix is `Netix/Site`. The app also publishes health snapshots to the configured health topic, defaulting to `Netix/Site/_health/bacnet-republisher`.
 
 Numeric BACnet values publish as JSON numbers. Boolean, enumerated, and character-string values publish as JSON strings. Failed point reads are omitted and counted in the app status.
+
+MQTT TLS uses platform root certificates by default. Operators can optionally configure CA, client certificate, and client key PEM file paths in Settings. Passwords and client key passphrases are only written to the TOML config when `Remember secrets` is enabled.
 
 ## Windows signing
 
@@ -42,5 +46,6 @@ Tag a release as `v*` to build, sign, verify, zip, and publish the Windows execu
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
+cargo build --locked --release
 cargo run
 ```

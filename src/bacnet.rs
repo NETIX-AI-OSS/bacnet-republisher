@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
-type Client = BACnetClient<BipTransport>;
+pub type BacnetIpClient = BACnetClient<BipTransport>;
 
 pub async fn discover_devices(
     config: &BacnetConfig,
@@ -34,18 +34,8 @@ pub async fn discover_devices(
         client.who_is(None, None).await?;
         tokio::time::sleep(Duration::from_millis(config.discovery_window_ms)).await;
 
-        for device in client.discovered_devices().await {
-            let instance = device.object_identifier.instance_number();
-            by_instance.insert(
-                instance,
-                DiscoveredDevice {
-                    instance,
-                    address: format_bip_mac(device.mac_address.as_slice()),
-                    vendor_id: device.vendor_id,
-                    max_apdu_length: device.max_apdu_length,
-                    last_seen_ms: device.last_seen.elapsed().as_millis(),
-                },
-            );
+        for device in collect_discovered_devices(&client).await {
+            by_instance.insert(device.instance, device);
         }
         client.stop().await?;
     }
@@ -71,6 +61,36 @@ pub async fn scan_device_objects(
         .await?;
     tokio::time::sleep(Duration::from_millis(config.discovery_window_ms)).await;
 
+    let objects = scan_device_objects_with_client(&client, device_instance, max_objects).await;
+    client.stop().await?;
+    objects
+}
+
+pub async fn collect_discovered_devices(client: &BacnetIpClient) -> Vec<DiscoveredDevice> {
+    let mut devices = client
+        .discovered_devices()
+        .await
+        .into_iter()
+        .map(|device| {
+            let instance = device.object_identifier.instance_number();
+            DiscoveredDevice {
+                instance,
+                address: format_bip_mac(device.mac_address.as_slice()),
+                vendor_id: device.vendor_id,
+                max_apdu_length: device.max_apdu_length,
+                last_seen_ms: device.last_seen.elapsed().as_millis(),
+            }
+        })
+        .collect::<Vec<_>>();
+    devices.sort_by_key(|device| device.instance);
+    devices
+}
+
+pub async fn scan_device_objects_with_client(
+    client: &BacnetIpClient,
+    device_instance: u32,
+    max_objects: usize,
+) -> Result<Vec<DeviceObject>> {
     let device_oid = ObjectIdentifier::new(ObjectType::DEVICE, device_instance)?;
     let count_ack = client
         .read_property_from_device(
@@ -106,27 +126,52 @@ pub async fn scan_device_objects(
             continue;
         }
         let object_identifier = ObjectIdentifier::new(object_type, object_instance)?;
-        let object_name = client
-            .read_property_from_device(
-                device_instance,
-                object_identifier,
-                PropertyIdentifier::OBJECT_NAME,
-                None,
-            )
-            .await
-            .ok()
-            .and_then(|ack| decode_scalar_value(&ack.property_value).ok())
-            .map(|value| value.to_string());
+        let object_name = read_scalar_property(
+            client,
+            device_instance,
+            object_identifier,
+            PropertyIdentifier::OBJECT_NAME,
+        )
+        .await
+        .map(|value| value.to_string())
+        .filter(|value| !value.trim().is_empty());
+        let description = read_scalar_property(
+            client,
+            device_instance,
+            object_identifier,
+            PropertyIdentifier::DESCRIPTION,
+        )
+        .await
+        .map(|value| value.to_string())
+        .filter(|value| !value.trim().is_empty());
+        let units = read_scalar_property(
+            client,
+            device_instance,
+            object_identifier,
+            PropertyIdentifier::UNITS,
+        )
+        .await
+        .map(|value| value.to_string())
+        .filter(|value| !value.trim().is_empty());
+        let present_value = read_scalar_property(
+            client,
+            device_instance,
+            object_identifier,
+            PropertyIdentifier::PRESENT_VALUE,
+        )
+        .await;
 
         objects.push(DeviceObject {
             device_instance,
             object_type: object_type_name(object_type),
             object_instance,
             object_name,
+            description,
+            units,
+            present_value,
         });
     }
 
-    client.stop().await?;
     Ok(objects)
 }
 
@@ -144,6 +189,7 @@ pub async fn poll_points_once(
         return Ok(PollOutcome {
             samples: Vec::new(),
             failures: Vec::new(),
+            warnings: Vec::new(),
         });
     }
 
@@ -156,9 +202,19 @@ pub async fn poll_points_once(
     client.who_is(None, None).await?;
     tokio::time::sleep(Duration::from_millis(bacnet.discovery_window_ms)).await;
 
+    let outcome = poll_points_once_with_client(&client, mqtt, &enabled).await;
+    client.stop().await?;
+    outcome
+}
+
+pub async fn poll_points_once_with_client(
+    client: &BacnetIpClient,
+    mqtt: &MqttConfig,
+    points: &[PointConfig],
+) -> Result<PollOutcome> {
     let mut by_device = HashMap::<u32, Vec<PollRequest>>::new();
     let mut failures = Vec::new();
-    for point in enabled {
+    for point in points.iter().filter(|point| point.enabled).cloned() {
         match PollRequest::from_point(point.clone()) {
             Ok(request) => by_device
                 .entry(point.device_instance)
@@ -172,29 +228,30 @@ pub async fn poll_points_once(
     }
 
     let mut samples = Vec::new();
+    let mut warnings = Vec::new();
     for (device_instance, requests) in by_device {
-        match read_device_group_rpm(&client, mqtt, device_instance, &requests).await {
+        match read_device_group_rpm(client, mqtt, device_instance, &requests).await {
             Ok(mut group_samples) => samples.append(&mut group_samples),
             Err(error) => {
-                let fallback = read_device_group_individual(&client, mqtt, &requests).await;
+                warnings.push(format!(
+                    "RPM failed for device {device_instance}; used fallback: {error:#}"
+                ));
+                let fallback = read_device_group_individual(client, mqtt, &requests).await;
                 for result in fallback {
                     match result {
                         Ok(sample) => samples.push(sample),
                         Err(failure) => failures.push(failure),
                     }
                 }
-                failures.push(PointFailure {
-                    point: requests[0].point.clone(),
-                    error: format!(
-                        "RPM failed for device {device_instance}; used fallback: {error:#}"
-                    ),
-                });
             }
         }
     }
 
-    client.stop().await?;
-    Ok(PollOutcome { samples, failures })
+    Ok(PollOutcome {
+        samples,
+        failures,
+        warnings,
+    })
 }
 
 pub fn point_from_object(object: &DeviceObject) -> PointConfig {
@@ -240,7 +297,7 @@ impl PollRequest {
 }
 
 async fn read_device_group_rpm(
-    client: &Client,
+    client: &BacnetIpClient,
     mqtt: &MqttConfig,
     device_instance: u32,
     requests: &[PollRequest],
@@ -296,8 +353,26 @@ async fn read_device_group_rpm(
     Ok(samples)
 }
 
+async fn read_scalar_property(
+    client: &BacnetIpClient,
+    device_instance: u32,
+    object_identifier: ObjectIdentifier,
+    property_identifier: PropertyIdentifier,
+) -> Option<crate::model::TelemetryValue> {
+    client
+        .read_property_from_device(
+            device_instance,
+            object_identifier,
+            property_identifier,
+            None,
+        )
+        .await
+        .ok()
+        .and_then(|ack| decode_scalar_value(&ack.property_value).ok())
+}
+
 async fn read_device_group_individual(
-    client: &Client,
+    client: &BacnetIpClient,
     mqtt: &MqttConfig,
     requests: &[PollRequest],
 ) -> Vec<Result<PointSample, PointFailure>> {
@@ -332,7 +407,7 @@ async fn read_device_group_individual(
     results
 }
 
-async fn build_client(config: &BacnetConfig, interface: Ipv4Addr) -> Result<Client> {
+async fn build_client(config: &BacnetConfig, interface: Ipv4Addr) -> Result<BacnetIpClient> {
     let mut transport = BipTransport::new(interface, config.port, config.broadcast_address);
     if let Some(bbmd) = &config.bbmd {
         transport.register_as_foreign_device(ForeignDeviceConfig {
@@ -392,6 +467,9 @@ mod tests {
             object_type: "analog_input".to_string(),
             object_instance: 2,
             object_name: Some("AHU1 Supply Temp".to_string()),
+            description: None,
+            units: None,
+            present_value: None,
         };
 
         let point = point_from_object(&object);

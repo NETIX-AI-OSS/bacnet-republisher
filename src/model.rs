@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -66,12 +67,15 @@ pub struct DiscoveredDevice {
     pub last_seen_ms: u128,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeviceObject {
     pub device_instance: u32,
     pub object_type: String,
     pub object_instance: u32,
     pub object_name: Option<String>,
+    pub description: Option<String>,
+    pub units: Option<String>,
+    pub present_value: Option<TelemetryValue>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -92,6 +96,7 @@ pub struct PointFailure {
 pub struct PollOutcome {
     pub samples: Vec<PointSample>,
     pub failures: Vec<PointFailure>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -120,10 +125,115 @@ impl fmt::Display for TelemetryValue {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishStats {
+    pub queued: usize,
     pub published: usize,
     pub failed: usize,
+    pub reconnects: usize,
+    pub last_error: Option<String>,
+}
+
+impl PublishStats {
+    pub fn empty() -> Self {
+        Self {
+            queued: 0,
+            published: 0,
+            failed: 0,
+            reconnects: 0,
+            last_error: None,
+        }
+    }
+
+    pub fn record_failure(&mut self, error: impl Into<String>) {
+        self.failed += 1;
+        self.last_error = Some(error.into());
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PointIdentity {
+    pub device_instance: u32,
+    pub object_type: String,
+    pub object_instance: u32,
+    pub property: String,
+}
+
+impl PointIdentity {
+    pub fn from_point(point: &PointConfig) -> Self {
+        Self {
+            device_instance: point.device_instance,
+            object_type: normalize_identity_part(&point.object_type),
+            object_instance: point.object_instance,
+            property: normalize_identity_part(&point.property),
+        }
+    }
+}
+
+impl Hash for PointIdentity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.device_instance.hash(state);
+        self.object_type.hash(state);
+        self.object_instance.hash(state);
+        self.property.hash(state);
+    }
+}
+
+impl fmt::Display for PointIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}:{}:{}:{}",
+            self.device_instance, self.object_type, self.object_instance, self.property
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PointStatus {
+    pub last_value: Option<TelemetryValue>,
+    pub last_sample_ms: Option<i64>,
+    pub stale: bool,
+    pub consecutive_failures: u32,
+    pub last_error: Option<String>,
+    pub last_publish_error: Option<String>,
+}
+
+impl Default for PointStatus {
+    fn default() -> Self {
+        Self {
+            last_value: None,
+            last_sample_ms: None,
+            stale: true,
+            consecutive_failures: 0,
+            last_error: None,
+            last_publish_error: None,
+        }
+    }
+}
+
+impl PointStatus {
+    pub fn record_sample(&mut self, sample: &PointSample) {
+        self.last_value = Some(sample.value.clone());
+        self.last_sample_ms = Some(sample.timestamp_ms);
+        self.stale = false;
+        self.consecutive_failures = 0;
+        self.last_error = None;
+    }
+
+    pub fn record_read_failure(&mut self, error: impl Into<String>) {
+        self.stale = true;
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.last_error = Some(error.into());
+    }
+
+    pub fn record_publish_success(&mut self) {
+        self.last_publish_error = None;
+    }
+
+    pub fn record_publish_failure(&mut self, error: impl Into<String>) {
+        self.last_publish_error = Some(error.into());
+    }
 }
 
 pub fn now_millis() -> i64 {
@@ -150,6 +260,10 @@ pub fn default_poll_interval_secs() -> u64 {
     10
 }
 
+fn normalize_identity_part(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace([' ', '-'], "_")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +278,41 @@ mod tests {
             TelemetryValue::Text("active".to_string()).as_json_value(),
             serde_json::json!("active")
         );
+    }
+
+    #[test]
+    fn point_status_success_clears_stale_state() {
+        let point = PointConfig {
+            device_instance: 100,
+            object_instance: 1,
+            ..PointConfig::default()
+        };
+        let sample = PointSample {
+            point,
+            value: TelemetryValue::Number(10.0),
+            topic: "Netix/Site/device_100/analog_input_1/present_value".to_string(),
+            timestamp_ms: 42,
+        };
+        let mut status = PointStatus::default();
+        status.record_read_failure("timeout");
+
+        status.record_sample(&sample);
+
+        assert!(!status.stale);
+        assert_eq!(status.consecutive_failures, 0);
+        assert_eq!(status.last_error, None);
+        assert_eq!(status.last_value, Some(TelemetryValue::Number(10.0)));
+    }
+
+    #[test]
+    fn point_status_failure_marks_stale() {
+        let mut status = PointStatus::default();
+
+        status.record_read_failure("timeout");
+        status.record_read_failure("timeout again");
+
+        assert!(status.stale);
+        assert_eq!(status.consecutive_failures, 2);
+        assert_eq!(status.last_error.as_deref(), Some("timeout again"));
     }
 }

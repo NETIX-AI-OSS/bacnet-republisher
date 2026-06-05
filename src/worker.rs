@@ -1,8 +1,11 @@
 use crate::bacnet::{discover_devices, poll_points_once, scan_device_objects};
 use crate::config::{BacnetConfig, MqttConfig};
 use crate::log::LogLevel;
-use crate::model::{DeviceObject, DiscoveredDevice, NetworkInterface, PointConfig, PointSample};
-use crate::mqtt::{publish_health, publish_samples, RumqttPublisher};
+use crate::model::{
+    DeviceObject, DiscoveredDevice, NetworkInterface, PointConfig, PointFailure, PointIdentity,
+    PointSample, PointStatus, PublishStats,
+};
+use crate::mqtt::{publish_health, HealthSnapshot, RumqttPublisher};
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
 use std::sync::{
@@ -17,7 +20,8 @@ pub enum WorkerEvent {
     Devices(Vec<DiscoveredDevice>),
     Objects(Vec<DeviceObject>),
     Samples(Vec<PointSample>),
-    PublishStatus { published: usize, failed: usize },
+    Failures(Vec<PointFailure>),
+    PublishStatus(PublishStats),
     Finished(String),
 }
 
@@ -139,25 +143,49 @@ pub fn spawn_poll_and_publish(
                         .ok();
                 }
             }
+            for warning in &outcome.warnings {
+                sender
+                    .send(WorkerEvent::Log(LogLevel::Warning, warning.clone()))
+                    .ok();
+            }
 
-            let mut publisher = RumqttPublisher::new(&mqtt);
-            let stats = publish_samples(&mut publisher, &mqtt, &outcome.samples).await;
+            let mut publisher = match RumqttPublisher::new(&mqtt) {
+                Ok(publisher) => publisher,
+                Err(error) => {
+                    sender
+                        .send(WorkerEvent::Log(
+                            LogLevel::Error,
+                            format!("MQTT publisher setup failed: {error:#}"),
+                        ))
+                        .ok();
+                    sender
+                        .send(WorkerEvent::Finished("Publishing failed".to_string()))
+                        .ok();
+                    return;
+                }
+            };
+            let stats = publisher
+                .publish_samples_confirmed(&mqtt, &outcome.samples)
+                .await;
             let _ = publish_health(
                 &mut publisher,
                 &mqtt,
-                stats.published,
-                outcome.failures.len(),
-                stats.failed,
+                HealthSnapshot {
+                    published: stats.published,
+                    failed_reads: outcome.failures.len(),
+                    failed_publishes: stats.failed,
+                    stale_points: outcome.failures.len(),
+                    reconnects: stats.reconnects,
+                    last_error: stats.last_error.clone(),
+                },
             )
             .await;
 
-            sender.send(WorkerEvent::Samples(outcome.samples)).ok();
             sender
-                .send(WorkerEvent::PublishStatus {
-                    published: stats.published,
-                    failed: stats.failed,
-                })
+                .send(WorkerEvent::Failures(outcome.failures.clone()))
                 .ok();
+            sender.send(WorkerEvent::Samples(outcome.samples)).ok();
+            sender.send(WorkerEvent::PublishStatus(stats.clone())).ok();
             sender
                 .send(WorkerEvent::Finished(format!(
                     "Published {} point(s), {} read failure(s), {} publish failure(s)",
@@ -189,7 +217,26 @@ pub fn spawn_republisher(
                 ))
                 .ok();
 
+            let mut publisher = match RumqttPublisher::new(&mqtt) {
+                Ok(publisher) => publisher,
+                Err(error) => {
+                    sender
+                        .send(WorkerEvent::Log(
+                            LogLevel::Error,
+                            format!("MQTT publisher setup failed: {error:#}"),
+                        ))
+                        .ok();
+                    sender
+                        .send(WorkerEvent::Finished(
+                            "Continuous republisher failed".to_string(),
+                        ))
+                        .ok();
+                    return;
+                }
+            };
+
             let mut last_polled = HashMap::<usize, Instant>::new();
+            let mut point_statuses = HashMap::<PointIdentity, PointStatus>::new();
             while !stop.load(Ordering::Relaxed) {
                 let now = Instant::now();
                 let due_points = points
@@ -218,6 +265,11 @@ pub fn spawn_republisher(
                             for (index, _) in due_points {
                                 last_polled.insert(index, now);
                             }
+                            for warning in &outcome.warnings {
+                                sender
+                                    .send(WorkerEvent::Log(LogLevel::Warning, warning.clone()))
+                                    .ok();
+                            }
                             for failure in &outcome.failures {
                                 sender
                                     .send(WorkerEvent::Log(
@@ -230,24 +282,41 @@ pub fn spawn_republisher(
                                     ))
                                     .ok();
                             }
-                            let mut publisher = RumqttPublisher::new(&mqtt);
-                            let stats =
-                                publish_samples(&mut publisher, &mqtt, &outcome.samples).await;
+                            for sample in &outcome.samples {
+                                point_statuses
+                                    .entry(PointIdentity::from_point(&sample.point))
+                                    .or_default()
+                                    .record_sample(sample);
+                            }
+                            for failure in &outcome.failures {
+                                point_statuses
+                                    .entry(PointIdentity::from_point(&failure.point))
+                                    .or_default()
+                                    .record_read_failure(failure.error.clone());
+                            }
+                            let stale_points = point_statuses
+                                .values()
+                                .filter(|status| status.stale)
+                                .count();
+                            let stats = publisher
+                                .publish_samples_confirmed(&mqtt, &outcome.samples)
+                                .await;
                             let _ = publish_health(
                                 &mut publisher,
                                 &mqtt,
-                                stats.published,
-                                outcome.failures.len(),
-                                stats.failed,
+                                HealthSnapshot {
+                                    published: stats.published,
+                                    failed_reads: outcome.failures.len(),
+                                    failed_publishes: stats.failed,
+                                    stale_points,
+                                    reconnects: stats.reconnects,
+                                    last_error: stats.last_error.clone(),
+                                },
                             )
                             .await;
+                            sender.send(WorkerEvent::Failures(outcome.failures)).ok();
                             sender.send(WorkerEvent::Samples(outcome.samples)).ok();
-                            sender
-                                .send(WorkerEvent::PublishStatus {
-                                    published: stats.published,
-                                    failed: stats.failed,
-                                })
-                                .ok();
+                            sender.send(WorkerEvent::PublishStatus(stats)).ok();
                         }
                         Err(error) => {
                             sender

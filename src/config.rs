@@ -1,4 +1,5 @@
 use crate::model::PointConfig;
+use crate::topic::{telemetry_topic, validate_publish_topic};
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -7,7 +8,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 const CONFIG_FILE_NAME: &str = "config.toml";
-pub const CURRENT_CONFIG_VERSION: u32 = 1;
+pub const CURRENT_CONFIG_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
@@ -65,6 +66,14 @@ pub struct MqttConfig {
     #[serde(default)]
     pub password: Option<String>,
     #[serde(default)]
+    pub ca_cert_path: Option<String>,
+    #[serde(default)]
+    pub client_cert_path: Option<String>,
+    #[serde(default)]
+    pub client_key_path: Option<String>,
+    #[serde(default)]
+    pub client_key_passphrase: Option<String>,
+    #[serde(default)]
     pub remember_secrets: bool,
     #[serde(default)]
     pub retain: bool,
@@ -121,6 +130,7 @@ impl AppConfig {
         let mut clone = self.clone();
         if !clone.mqtt.remember_secrets {
             clone.mqtt.password = None;
+            clone.mqtt.client_key_passphrase = None;
         }
         clone
     }
@@ -144,6 +154,33 @@ impl AppConfig {
         if self.mqtt.topic_prefix.trim().is_empty() {
             return Err("MQTT topic prefix cannot be empty".to_string());
         }
+        validate_publish_topic(&self.mqtt.health_topic)
+            .map_err(|error| format!("MQTT health topic is invalid: {error}"))?;
+        if path_is_empty(&self.mqtt.ca_cert_path) {
+            return Err("MQTT CA certificate path cannot be blank".to_string());
+        }
+        if path_is_empty(&self.mqtt.client_cert_path) {
+            return Err("MQTT client certificate path cannot be blank".to_string());
+        }
+        if path_is_empty(&self.mqtt.client_key_path) {
+            return Err("MQTT client key path cannot be blank".to_string());
+        }
+        let cert_set = self
+            .mqtt
+            .client_cert_path
+            .as_ref()
+            .is_some_and(|v| !v.trim().is_empty());
+        let key_set = self
+            .mqtt
+            .client_key_path
+            .as_ref()
+            .is_some_and(|v| !v.trim().is_empty());
+        if cert_set != key_set {
+            return Err(
+                "MQTT client certificate and client key paths must be configured together"
+                    .to_string(),
+            );
+        }
         for point in &self.points {
             if point.enabled && point.device_instance == 0 {
                 return Err(format!(
@@ -156,6 +193,11 @@ impl AppConfig {
                     "{} poll interval cannot be 0",
                     point.display_name()
                 ));
+            }
+            if point.enabled {
+                validate_publish_topic(&telemetry_topic(&self.mqtt, point)).map_err(|error| {
+                    format!("{} MQTT topic is invalid: {error}", point.display_name())
+                })?;
             }
         }
         Ok(())
@@ -187,6 +229,10 @@ impl Default for MqttConfig {
             health_topic: default_health_topic(),
             username: None,
             password: None,
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
+            client_key_passphrase: None,
             remember_secrets: false,
             retain: false,
             keep_alive_secs: default_keep_alive_secs(),
@@ -306,6 +352,10 @@ fn default_ui_theme() -> UiTheme {
     UiTheme::Auto
 }
 
+fn path_is_empty(value: &Option<String>) -> bool {
+    value.as_ref().is_some_and(|path| path.trim().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,23 +365,30 @@ mod tests {
         let mut config = AppConfig::default();
         config.mqtt.username = Some("user".to_string());
         config.mqtt.password = Some("secret".to_string());
+        config.mqtt.client_key_passphrase = Some("key-secret".to_string());
         config.mqtt.remember_secrets = false;
 
         let saved = config.sanitized_for_save();
 
         assert_eq!(saved.mqtt.username.as_deref(), Some("user"));
         assert_eq!(saved.mqtt.password, None);
+        assert_eq!(saved.mqtt.client_key_passphrase, None);
     }
 
     #[test]
     fn save_keeps_password_when_secret_persistence_is_enabled() {
         let mut config = AppConfig::default();
         config.mqtt.password = Some("secret".to_string());
+        config.mqtt.client_key_passphrase = Some("key-secret".to_string());
         config.mqtt.remember_secrets = true;
 
         let saved = config.sanitized_for_save();
 
         assert_eq!(saved.mqtt.password.as_deref(), Some("secret"));
+        assert_eq!(
+            saved.mqtt.client_key_passphrase.as_deref(),
+            Some("key-secret")
+        );
     }
 
     #[test]
@@ -351,5 +408,51 @@ mod tests {
 
         assert_eq!(loaded.points.len(), 1);
         assert_eq!(loaded.points[0].tag_path, "AHU1/SupplyTemp");
+    }
+
+    #[test]
+    fn migrates_version_one_config_to_current() {
+        let raw = r#"
+version = 1
+
+[bacnet]
+discover_all_interfaces = true
+port = 47808
+broadcast_address = "255.255.255.255"
+discovery_window_ms = 3000
+apdu_timeout_ms = 2000
+
+[mqtt]
+host = "broker.example.com"
+port = 8883
+use_tls = true
+client_id = "republisher"
+topic_prefix = "Netix/Site"
+health_topic = "Netix/Site/_health/bacnet-republisher"
+retain = false
+keep_alive_secs = 30
+
+[ui]
+theme = "auto"
+"#;
+        let mut config: AppConfig = toml::from_str(raw).unwrap();
+
+        config.migrate();
+
+        assert_eq!(config.version, CURRENT_CONFIG_VERSION);
+        assert_eq!(config.mqtt.ca_cert_path, None);
+        assert_eq!(config.mqtt.client_cert_path, None);
+        assert_eq!(config.mqtt.client_key_path, None);
+        assert_eq!(config.mqtt.client_key_passphrase, None);
+    }
+
+    #[test]
+    fn validation_rejects_incomplete_client_certificate_pair() {
+        let mut config = AppConfig::default();
+        config.mqtt.client_cert_path = Some("/tmp/client.pem".to_string());
+
+        let error = config.validate().unwrap_err();
+
+        assert!(error.contains("configured together"));
     }
 }

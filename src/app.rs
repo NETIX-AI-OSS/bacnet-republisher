@@ -1,7 +1,10 @@
 use crate::bacnet::point_from_object;
 use crate::config::{self, AppConfig, BbmdConfig, UiTheme};
 use crate::log::{LogBuffer, LogLevel};
-use crate::model::{DeviceObject, DiscoveredDevice, NetworkInterface, PointConfig, PointSample};
+use crate::model::{
+    DeviceObject, DiscoveredDevice, NetworkInterface, PointConfig, PointIdentity, PointSample,
+    PointStatus,
+};
 use crate::network::{interface_choices, ipv4_interfaces};
 use crate::worker::{
     spawn_discovery, spawn_object_scan, spawn_poll_and_publish, spawn_republisher, WorkerEvent,
@@ -14,6 +17,7 @@ use iced::{
     theme, window, Alignment, Background, Border, Color, Element, Length, Shadow, Size,
     Subscription, Task, Theme,
 };
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::{
@@ -33,6 +37,7 @@ pub struct BacnetRepublisher {
     devices: Vec<DiscoveredDevice>,
     scanned_objects: Vec<DeviceObject>,
     samples: Vec<PointSample>,
+    point_statuses: HashMap<PointIdentity, PointStatus>,
     status: String,
     settings: SettingsDraft,
     point_editor: PointEditor,
@@ -77,6 +82,10 @@ pub enum Message {
     MqttHealthTopicChanged(String),
     MqttUsernameChanged(String),
     MqttPasswordChanged(String),
+    MqttCaCertPathChanged(String),
+    MqttClientCertPathChanged(String),
+    MqttClientKeyPathChanged(String),
+    MqttClientKeyPassphraseChanged(String),
     MqttRememberSecretsChanged(bool),
     MqttRetainChanged(bool),
     MqttKeepAliveChanged(String),
@@ -134,6 +143,10 @@ struct SettingsDraft {
     mqtt_health_topic: String,
     mqtt_username: String,
     mqtt_password: String,
+    mqtt_ca_cert_path: String,
+    mqtt_client_cert_path: String,
+    mqtt_client_key_path: String,
+    mqtt_client_key_passphrase: String,
     mqtt_remember_secrets: bool,
     mqtt_retain: bool,
     mqtt_keep_alive_secs: String,
@@ -168,6 +181,14 @@ impl SettingsDraft {
             mqtt_health_topic: config.mqtt.health_topic.clone(),
             mqtt_username: config.mqtt.username.clone().unwrap_or_default(),
             mqtt_password: config.mqtt.password.clone().unwrap_or_default(),
+            mqtt_ca_cert_path: config.mqtt.ca_cert_path.clone().unwrap_or_default(),
+            mqtt_client_cert_path: config.mqtt.client_cert_path.clone().unwrap_or_default(),
+            mqtt_client_key_path: config.mqtt.client_key_path.clone().unwrap_or_default(),
+            mqtt_client_key_passphrase: config
+                .mqtt
+                .client_key_passphrase
+                .clone()
+                .unwrap_or_default(),
             mqtt_remember_secrets: config.mqtt.remember_secrets,
             mqtt_retain: config.mqtt.retain,
             mqtt_keep_alive_secs: config.mqtt.keep_alive_secs.to_string(),
@@ -198,6 +219,10 @@ impl SettingsDraft {
         config.mqtt.health_topic = self.mqtt_health_topic.trim().to_string();
         config.mqtt.username = non_empty_string(&self.mqtt_username);
         config.mqtt.password = non_empty_string(&self.mqtt_password);
+        config.mqtt.ca_cert_path = non_empty_string(&self.mqtt_ca_cert_path);
+        config.mqtt.client_cert_path = non_empty_string(&self.mqtt_client_cert_path);
+        config.mqtt.client_key_path = non_empty_string(&self.mqtt_client_key_path);
+        config.mqtt.client_key_passphrase = non_empty_string(&self.mqtt_client_key_passphrase);
         config.mqtt.remember_secrets = self.mqtt_remember_secrets;
         config.mqtt.retain = self.mqtt_retain;
         config.mqtt.keep_alive_secs = parse_u64(&self.mqtt_keep_alive_secs, "MQTT keep-alive")?;
@@ -289,6 +314,7 @@ impl BacnetRepublisher {
                 devices: Vec::new(),
                 scanned_objects: Vec::new(),
                 samples: Vec::new(),
+                point_statuses: HashMap::new(),
                 status,
                 selected_point: None,
                 worker_sender,
@@ -367,6 +393,14 @@ impl BacnetRepublisher {
             Message::MqttHealthTopicChanged(value) => self.settings.mqtt_health_topic = value,
             Message::MqttUsernameChanged(value) => self.settings.mqtt_username = value,
             Message::MqttPasswordChanged(value) => self.settings.mqtt_password = value,
+            Message::MqttCaCertPathChanged(value) => self.settings.mqtt_ca_cert_path = value,
+            Message::MqttClientCertPathChanged(value) => {
+                self.settings.mqtt_client_cert_path = value
+            }
+            Message::MqttClientKeyPathChanged(value) => self.settings.mqtt_client_key_path = value,
+            Message::MqttClientKeyPassphraseChanged(value) => {
+                self.settings.mqtt_client_key_passphrase = value
+            }
             Message::MqttRememberSecretsChanged(value) => {
                 self.settings.mqtt_remember_secrets = value
             }
@@ -475,8 +509,7 @@ impl BacnetRepublisher {
                             .width(Length::FillPortion(1)),
                         text(format!("{} {}", object.object_type, object.object_instance))
                             .width(Length::FillPortion(2)),
-                        text(object.object_name.clone().unwrap_or_default())
-                            .width(Length::FillPortion(2)),
+                        text(self.object_summary(object)).width(Length::FillPortion(3)),
                         button("Add point").on_press(Message::AddObjectAsPoint(index)),
                     ]
                     .spacing(12)
@@ -576,6 +609,7 @@ impl BacnetRepublisher {
                             &point.tag_path
                         })
                         .width(Length::FillPortion(2)),
+                        text(self.point_status_label(point)).width(Length::FillPortion(2)),
                         button("Edit").on_press(Message::EditPoint(index)),
                         button("Delete").on_press(Message::DeletePoint(index)),
                     ]
@@ -743,6 +777,32 @@ impl BacnetRepublisher {
                         "Password",
                         &self.settings.mqtt_password,
                         Message::MqttPasswordChanged
+                    ),
+                ]
+                .spacing(12),
+                row![
+                    labeled_input(
+                        "CA certificate PEM",
+                        &self.settings.mqtt_ca_cert_path,
+                        Message::MqttCaCertPathChanged
+                    ),
+                    labeled_input(
+                        "Client certificate PEM",
+                        &self.settings.mqtt_client_cert_path,
+                        Message::MqttClientCertPathChanged
+                    ),
+                ]
+                .spacing(12),
+                row![
+                    labeled_input(
+                        "Client key PEM",
+                        &self.settings.mqtt_client_key_path,
+                        Message::MqttClientKeyPathChanged
+                    ),
+                    labeled_input(
+                        "Client key passphrase",
+                        &self.settings.mqtt_client_key_passphrase,
+                        Message::MqttClientKeyPassphraseChanged
                     ),
                 ]
                 .spacing(12),
@@ -994,15 +1054,43 @@ impl BacnetRepublisher {
                 WorkerEvent::Log(level, message) => self.set_status(level, message),
                 WorkerEvent::Devices(devices) => self.devices = devices,
                 WorkerEvent::Objects(objects) => self.scanned_objects = objects,
-                WorkerEvent::Samples(samples) => self.samples = samples,
-                WorkerEvent::PublishStatus { published, failed } => self.set_status(
-                    if failed == 0 {
-                        LogLevel::Info
-                    } else {
-                        LogLevel::Warning
-                    },
-                    format!("MQTT publish complete: {published} published, {failed} failed"),
-                ),
+                WorkerEvent::Samples(samples) => self.record_samples(samples),
+                WorkerEvent::Failures(failures) => {
+                    for failure in failures {
+                        self.point_statuses
+                            .entry(PointIdentity::from_point(&failure.point))
+                            .or_default()
+                            .record_read_failure(failure.error);
+                    }
+                }
+                WorkerEvent::PublishStatus(stats) => {
+                    let last_error = stats
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| "MQTT publish failed".to_string());
+                    for sample in &self.samples {
+                        let status = self
+                            .point_statuses
+                            .entry(PointIdentity::from_point(&sample.point))
+                            .or_default();
+                        if stats.failed == 0 {
+                            status.record_publish_success();
+                        } else {
+                            status.record_publish_failure(last_error.clone());
+                        }
+                    }
+                    self.set_status(
+                        if stats.failed == 0 {
+                            LogLevel::Info
+                        } else {
+                            LogLevel::Warning
+                        },
+                        format!(
+                            "MQTT publish complete: {} published, {} failed",
+                            stats.published, stats.failed
+                        ),
+                    );
+                }
                 WorkerEvent::Finished(message) => {
                     self.working = false;
                     if message.contains("republisher stopped") {
@@ -1013,6 +1101,51 @@ impl BacnetRepublisher {
                 }
             }
         }
+    }
+
+    fn record_samples(&mut self, samples: Vec<PointSample>) {
+        for sample in &samples {
+            self.point_statuses
+                .entry(PointIdentity::from_point(&sample.point))
+                .or_default()
+                .record_sample(sample);
+        }
+        self.samples = samples;
+    }
+
+    fn point_status_label(&self, point: &PointConfig) -> String {
+        let Some(status) = self.point_statuses.get(&PointIdentity::from_point(point)) else {
+            return "No sample".to_string();
+        };
+        if let Some(error) = &status.last_error {
+            return format!("Stale: {error}");
+        }
+        if let Some(error) = &status.last_publish_error {
+            return format!("Publish error: {error}");
+        }
+        match (&status.last_value, status.last_sample_ms) {
+            (Some(value), Some(timestamp)) => format!("OK {value} @ {timestamp}"),
+            (Some(value), None) => format!("OK {value}"),
+            _ if status.stale => "Stale".to_string(),
+            _ => "OK".to_string(),
+        }
+    }
+
+    fn object_summary(&self, object: &DeviceObject) -> String {
+        let mut parts = Vec::new();
+        if let Some(name) = &object.object_name {
+            parts.push(name.clone());
+        }
+        if let Some(description) = &object.description {
+            parts.push(description.clone());
+        }
+        if let Some(units) = &object.units {
+            parts.push(format!("units {units}"));
+        }
+        if let Some(value) = &object.present_value {
+            parts.push(format!("present {value}"));
+        }
+        parts.join(" | ")
     }
 
     fn enabled_point_count(&self) -> usize {
