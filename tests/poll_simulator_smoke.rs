@@ -7,8 +7,10 @@ use bacnet_republisher::seed::simulator_points;
 #[tokio::test]
 #[ignore = "requires local BACnet simulator on UDP/47808"]
 async fn polls_simulator_points_via_rpm() {
-    let mut config = BacnetConfig::default();
-    config.discover_all_interfaces = false;
+    let mut config = BacnetConfig {
+        discover_all_interfaces: false,
+        ..BacnetConfig::default()
+    };
     let interfaces = ipv4_interfaces();
     if let Some(bridge) = interfaces
         .iter()

@@ -91,8 +91,10 @@ mod tests {
 
     #[test]
     fn resolve_bind_prefers_selected_interface() {
-        let mut config = BacnetConfig::default();
-        config.selected_interface = Some(Ipv4Addr::new(10, 1, 2, 3));
+        let config = BacnetConfig {
+            selected_interface: Some(Ipv4Addr::new(10, 1, 2, 3)),
+            ..BacnetConfig::default()
+        };
         let interfaces = vec![NetworkInterface {
             name: "en0".to_string(),
             addr: Ipv4Addr::new(192, 168, 1, 5),

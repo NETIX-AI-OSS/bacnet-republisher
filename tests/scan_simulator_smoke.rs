@@ -6,8 +6,10 @@ use bacnet_republisher::network::ipv4_interfaces;
 #[tokio::test]
 #[ignore = "requires local BACnet simulator on UDP/47808 with ReadProperty support"]
 async fn scans_objects_on_simulator_device_ahu_l_001() {
-    let mut config = BacnetConfig::default();
-    config.discover_all_interfaces = false;
+    let mut config = BacnetConfig {
+        discover_all_interfaces: false,
+        ..BacnetConfig::default()
+    };
     let interfaces = ipv4_interfaces();
     if let Some(bridge) = interfaces
         .iter()
