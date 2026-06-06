@@ -80,3 +80,46 @@ pub fn simulator_points() -> Vec<PointConfig> {
         },
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simulator_points_returns_seven_points() {
+        let points = simulator_points();
+        assert_eq!(points.len(), 7);
+    }
+
+    #[test]
+    fn simulator_points_all_enabled() {
+        let points = simulator_points();
+        assert!(points.iter().all(|p| p.enabled));
+    }
+
+    #[test]
+    fn simulator_points_expected_device_instances() {
+        let points = simulator_points();
+        let instances: Vec<u32> = points.iter().map(|p| p.device_instance).collect();
+        // All three simulator devices must appear
+        assert!(instances.contains(&10700), "AHU-L-001 (10700) missing");
+        assert!(instances.contains(&10900), "VAV-OFC-001 (10900) missing");
+        assert!(instances.contains(&10600), "PLANT-MTR-001 (10600) missing");
+    }
+
+    #[test]
+    fn simulator_points_ahu_has_three_points() {
+        let points = simulator_points();
+        let ahu_points: Vec<_> = points
+            .iter()
+            .filter(|p| p.device_instance == 10700)
+            .collect();
+        assert_eq!(ahu_points.len(), 3);
+    }
+
+    #[test]
+    fn simulator_points_tag_paths_are_non_empty() {
+        let points = simulator_points();
+        assert!(points.iter().all(|p| !p.tag_path.is_empty()));
+    }
+}

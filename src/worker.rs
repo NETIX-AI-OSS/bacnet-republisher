@@ -8,7 +8,7 @@ use crate::import::merge_imported_points;
 use crate::log::LogLevel;
 use crate::model::{
     BulkTagImportOutcome, DeviceObject, DiscoveredDevice, NetworkInterface, PointConfig,
-    PointFailure, PointIdentity, PointSample, PointStatus, PublishStats,
+    PointFailure, PointIdentity, PointSample, PointStatus, PollOutcome, PublishStats,
 };
 use crate::mqtt::{publish_health, HealthSnapshot, RumqttPublisher};
 use crate::network::resolve_bacnet_bind_address;
@@ -328,36 +328,10 @@ pub fn spawn_poll_and_publish(
                     return;
                 }
             };
-            let stats = publisher
-                .publish_samples_confirmed(&mqtt, &outcome.samples)
-                .await;
-            let _ = publish_health(
-                &mut publisher,
-                &mqtt,
-                HealthSnapshot {
-                    published: stats.published,
-                    failed_reads: outcome.failures.len(),
-                    failed_publishes: stats.failed,
-                    stale_points: outcome.failures.len(),
-                    reconnects: stats.reconnects,
-                    last_error: stats.last_error.clone(),
-                },
-            )
-            .await;
-
-            sender
-                .send(WorkerEvent::Failures(outcome.failures.clone()))
-                .ok();
-            sender.send(WorkerEvent::Samples(outcome.samples)).ok();
-            sender.send(WorkerEvent::PublishStatus(stats.clone())).ok();
-            sender
-                .send(WorkerEvent::Finished(format!(
-                    "Published {} point(s), {} read failure(s), {} publish failure(s)",
-                    stats.published,
-                    outcome.failures.len(),
-                    stats.failed
-                )))
-                .ok();
+            let stale_points = outcome.failures.len();
+            let finished_msg =
+                emit_poll_outcome(&sender, &mut publisher, &mqtt, &outcome, stale_points).await;
+            sender.send(WorkerEvent::Finished(finished_msg)).ok();
         });
     });
 }
@@ -492,23 +466,6 @@ pub fn spawn_republisher(
                             for (index, _) in due_points {
                                 last_polled.insert(index, now);
                             }
-                            for warning in &outcome.warnings {
-                                sender
-                                    .send(WorkerEvent::Log(LogLevel::Warning, warning.clone()))
-                                    .ok();
-                            }
-                            for failure in &outcome.failures {
-                                sender
-                                    .send(WorkerEvent::Log(
-                                        LogLevel::Warning,
-                                        format!(
-                                            "{} read failed: {}",
-                                            failure.point.display_name(),
-                                            failure.error
-                                        ),
-                                    ))
-                                    .ok();
-                            }
                             for sample in &outcome.samples {
                                 point_statuses
                                     .entry(PointIdentity::from_point(&sample.point))
@@ -525,25 +482,14 @@ pub fn spawn_republisher(
                                 .values()
                                 .filter(|status| status.stale)
                                 .count();
-                            let stats = publisher
-                                .publish_samples_confirmed(&mqtt, &outcome.samples)
-                                .await;
-                            let _ = publish_health(
+                            emit_poll_outcome(
+                                &sender,
                                 &mut publisher,
                                 &mqtt,
-                                HealthSnapshot {
-                                    published: stats.published,
-                                    failed_reads: outcome.failures.len(),
-                                    failed_publishes: stats.failed,
-                                    stale_points,
-                                    reconnects: stats.reconnects,
-                                    last_error: stats.last_error.clone(),
-                                },
+                                &outcome,
+                                stale_points,
                             )
                             .await;
-                            sender.send(WorkerEvent::Failures(outcome.failures)).ok();
-                            sender.send(WorkerEvent::Samples(outcome.samples)).ok();
-                            sender.send(WorkerEvent::PublishStatus(stats)).ok();
                         }
                         Err(error) => {
                             sender
@@ -567,6 +513,64 @@ pub fn spawn_republisher(
                 .ok();
         });
     });
+}
+
+/// Shared post-poll emit sequence: log failures/warnings, publish samples and health,
+/// then send the `Failures`, `Samples`, and `PublishStatus` events to the UI.
+/// Returns a human-readable summary string (used by one-shot callers as a `Finished` message).
+async fn emit_poll_outcome(
+    sender: &Sender<WorkerEvent>,
+    publisher: &mut RumqttPublisher,
+    mqtt: &MqttConfig,
+    outcome: &PollOutcome,
+    stale_points: usize,
+) -> String {
+    for warning in &outcome.warnings {
+        sender
+            .send(WorkerEvent::Log(LogLevel::Warning, warning.clone()))
+            .ok();
+    }
+    for failure in &outcome.failures {
+        sender
+            .send(WorkerEvent::Log(
+                LogLevel::Warning,
+                format!(
+                    "{} read failed: {}",
+                    failure.point.display_name(),
+                    failure.error
+                ),
+            ))
+            .ok();
+    }
+    let stats = publisher
+        .publish_samples_confirmed(mqtt, &outcome.samples)
+        .await;
+    let _ = publish_health(
+        publisher,
+        mqtt,
+        HealthSnapshot {
+            published: stats.published,
+            failed_reads: outcome.failures.len(),
+            failed_publishes: stats.failed,
+            stale_points,
+            reconnects: stats.reconnects,
+            last_error: stats.last_error.clone(),
+        },
+    )
+    .await;
+    sender
+        .send(WorkerEvent::Failures(outcome.failures.clone()))
+        .ok();
+    sender
+        .send(WorkerEvent::Samples(outcome.samples.clone()))
+        .ok();
+    sender.send(WorkerEvent::PublishStatus(stats.clone())).ok();
+    format!(
+        "Published {} point(s), {} read failure(s), {} publish failure(s)",
+        stats.published,
+        outcome.failures.len(),
+        stats.failed
+    )
 }
 
 fn run_async<F>(sender: Sender<WorkerEvent>, future: F)

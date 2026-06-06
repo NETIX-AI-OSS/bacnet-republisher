@@ -6,8 +6,8 @@ use crate::model::{
 use crate::network::resolve_bacnet_bind_address;
 use crate::topic::telemetry_topic;
 use crate::value::{
-    decode_object_identifier_value, decode_scalar_value, decode_unsigned_value,
-    object_type_from_text, object_type_name, property_identifier_from_text,
+    decode_object_id, decode_scalar_value, decode_unsigned, object_type_from_text,
+    object_type_name, property_identifier_from_text,
 };
 use anyhow::{anyhow, Context, Result};
 use bacnet_client::client::BACnetClient;
@@ -126,7 +126,7 @@ pub async fn scan_device_objects_with_client(
         )
         .await
         .context("failed to read objectList array length")?;
-    let count = decode_unsigned_value(&count_ack.property_value)
+    let count = decode_unsigned(&count_ack.property_value)
         .context("failed to decode objectList length")? as usize;
 
     let mut objects = Vec::new();
@@ -142,9 +142,7 @@ pub async fn scan_device_objects_with_client(
         let Ok(ack) = ack else {
             continue;
         };
-        let Ok((object_type, object_instance)) =
-            decode_object_identifier_value(&ack.property_value)
-        else {
+        let Ok((object_type, object_instance)) = decode_object_id(&ack.property_value) else {
             continue;
         };
         if object_type == ObjectType::DEVICE {
