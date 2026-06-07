@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn decodes_signed_zero_length_is_zero() {
         // Tag 3, length 0 → value 0
-        let packet = vec![(3u8 << 4) | 0u8];
+        let packet = vec![(3u8 << 4)];
         let result = decode_scalar_value(&packet).unwrap();
         assert_eq!(result, TelemetryValue::Number(0.0));
     }
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn decodes_empty_character_string() {
         // Tag 7, length 0
-        let packet = vec![(7u8 << 4) | 0u8];
+        let packet = vec![(7u8 << 4)];
         let result = decode_scalar_value(&packet).unwrap();
         assert_eq!(result, TelemetryValue::Text(String::new()));
     }
