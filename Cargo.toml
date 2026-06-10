@@ -33,5 +33,5 @@ bacnet-encoding = "0.9.0"
 bacnet-network = "0.9.0"
 tempfile = "3.23"
 
-[target.'cfg(windows)'.build-dependencies]
+[build-dependencies]
 winresource = "0.1"
