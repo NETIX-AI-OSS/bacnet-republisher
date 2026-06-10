@@ -172,17 +172,6 @@ pub fn card<'a, Message: 'a>(
         .into()
 }
 
-pub fn panel<'a, Message: 'a>(
-    palette: Palette,
-    content: impl Into<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    container(content)
-        .padding(18)
-        .width(Length::Fill)
-        .style(move |_| panel_style(palette.surface, palette.border, 8.0, false))
-        .into()
-}
-
 pub fn sidebar_style(palette: Palette) -> iced::widget::container::Style {
     panel_style(palette.sidebar, Color::TRANSPARENT, 0.0, false)
 }

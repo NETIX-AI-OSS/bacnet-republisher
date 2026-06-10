@@ -40,6 +40,7 @@ pub struct BacnetRepublisher {
     samples: Vec<PointSample>,
     point_statuses: HashMap<PointIdentity, PointStatus>,
     status: String,
+    status_level: LogLevel,
     settings: SettingsDraft,
     point_editor: PointEditor,
     selected_point: Option<usize>,
@@ -325,6 +326,7 @@ impl BacnetRepublisher {
                 samples: Vec::new(),
                 point_statuses: HashMap::new(),
                 status,
+                status_level: LogLevel::Info,
                 selected_point: None,
                 worker_sender,
                 worker_receiver,
@@ -1946,6 +1948,7 @@ impl BacnetRepublisher {
     fn set_status(&mut self, level: LogLevel, message: impl Into<String>) {
         let message = message.into();
         self.status = message.clone();
+        self.status_level = level;
         self.logs.push(level, message);
     }
 
@@ -2037,23 +2040,10 @@ impl BacnetRepublisher {
     }
 
     fn status_chip_kind(&self) -> ChipKind {
-        let lower = self.status.to_ascii_lowercase();
-        if lower.contains("error") || lower.contains("failed") || lower.contains("cannot") {
-            ChipKind::Danger
-        } else if lower.contains("warning")
-            || lower.contains("stale")
-            || lower.contains("stopping")
-            || lower.contains("enable at least")
-        {
-            ChipKind::Warning
-        } else if lower.contains("saved")
-            || lower.contains("complete")
-            || lower.contains("loaded")
-            || lower.contains("ready")
-        {
-            ChipKind::Success
-        } else {
-            ChipKind::Accent
+        match self.status_level {
+            LogLevel::Error => ChipKind::Danger,
+            LogLevel::Warning => ChipKind::Warning,
+            LogLevel::Info => ChipKind::Accent,
         }
     }
 
@@ -2190,4 +2180,179 @@ fn parse_ipv4(value: &str, label: &str) -> Result<Ipv4Addr, String> {
         .trim()
         .parse::<Ipv4Addr>()
         .map_err(|_| format!("{label} must be an IPv4 address"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- compact_config_path ---
+
+    #[test]
+    fn compact_config_path_returns_parent_and_filename() {
+        let path = Path::new("/home/user/.config/bacnet/config.toml");
+        assert_eq!(compact_config_path(path), "bacnet/config.toml");
+    }
+
+    #[test]
+    fn compact_config_path_root_fallback() {
+        // If there is no meaningful parent name, just return the filename.
+        let path = Path::new("config.toml");
+        assert_eq!(compact_config_path(path), "config.toml");
+    }
+
+    // --- format_timestamp ---
+
+    #[test]
+    fn format_timestamp_valid_millis() {
+        // 2024-01-15 00:00:00 UTC = 1705276800000 ms
+        let result = format_timestamp(1_705_276_800_000);
+        // The string format is "%Y-%m-%d %H:%M:%S" in local time; just verify it
+        // is non-empty and contains a date-like structure.
+        assert!(result.contains('-'), "expected date separator: {result}");
+        assert!(result.contains(':'), "expected time separator: {result}");
+    }
+
+    #[test]
+    fn format_timestamp_negative_millis_returns_pre_epoch_date() {
+        // chrono's from_timestamp_millis accepts negative values (pre-epoch).
+        // The result should be a formatted date string, not the raw integer.
+        let result = format_timestamp(-1);
+        assert!(
+            result.contains('-'),
+            "expected a date string, got: {result}"
+        );
+        assert!(
+            result.contains(':'),
+            "expected a time string, got: {result}"
+        );
+    }
+
+    // --- non_empty_string ---
+
+    #[test]
+    fn non_empty_string_returns_some_for_non_blank() {
+        assert_eq!(non_empty_string("hello"), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn non_empty_string_trims_whitespace() {
+        assert_eq!(non_empty_string("  hi  "), Some("hi".to_string()));
+    }
+
+    #[test]
+    fn non_empty_string_returns_none_for_blank() {
+        assert_eq!(non_empty_string(""), None);
+        assert_eq!(non_empty_string("   "), None);
+    }
+
+    // --- parse_u16 ---
+
+    #[test]
+    fn parse_u16_valid() {
+        assert_eq!(parse_u16("8883", "port"), Ok(8883u16));
+    }
+
+    #[test]
+    fn parse_u16_trims_whitespace() {
+        assert_eq!(parse_u16("  47808  ", "port"), Ok(47808u16));
+    }
+
+    #[test]
+    fn parse_u16_invalid_returns_error() {
+        assert!(parse_u16("99999", "port").is_err());
+        assert!(parse_u16("abc", "port").is_err());
+    }
+
+    // --- parse_u32 ---
+
+    #[test]
+    fn parse_u32_valid() {
+        assert_eq!(parse_u32("12345", "instance"), Ok(12345u32));
+    }
+
+    #[test]
+    fn parse_u32_invalid_returns_error() {
+        assert!(parse_u32("-1", "instance").is_err());
+    }
+
+    // --- parse_u64 ---
+
+    #[test]
+    fn parse_u64_valid() {
+        assert_eq!(parse_u64("3000", "window"), Ok(3000u64));
+    }
+
+    #[test]
+    fn parse_u64_invalid_returns_error() {
+        assert!(parse_u64("not_a_number", "window").is_err());
+    }
+
+    // --- parse_ipv4 ---
+
+    #[test]
+    fn parse_ipv4_valid() {
+        use std::net::Ipv4Addr;
+        assert_eq!(
+            parse_ipv4("192.168.1.1", "addr"),
+            Ok(Ipv4Addr::new(192, 168, 1, 1))
+        );
+    }
+
+    #[test]
+    fn parse_ipv4_broadcast() {
+        use std::net::Ipv4Addr;
+        assert_eq!(
+            parse_ipv4("255.255.255.255", "addr"),
+            Ok(Ipv4Addr::BROADCAST)
+        );
+    }
+
+    #[test]
+    fn parse_ipv4_invalid_returns_error() {
+        assert!(parse_ipv4("not.an.ip", "addr").is_err());
+        assert!(parse_ipv4("256.0.0.1", "addr").is_err());
+    }
+
+    // --- initial_page ---
+    //
+    // These tests mutate the process environment, which is shared across
+    // Rust's parallel test threads. We serialize all three under a single
+    // Mutex so they cannot interfere with each other.
+
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn initial_page_defaults_to_overview_when_env_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("BACNET_REPUBLISHER_INITIAL_PAGE");
+        assert_eq!(initial_page(), Page::Overview);
+    }
+
+    #[test]
+    fn initial_page_parses_known_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for (input, expected) in [
+            ("discover", Page::Discover),
+            ("DISCOVER", Page::Discover),
+            ("points", Page::Points),
+            ("republish", Page::Republish),
+            ("publish", Page::Republish),
+            ("settings", Page::Settings),
+            ("logs", Page::Logs),
+        ] {
+            std::env::set_var("BACNET_REPUBLISHER_INITIAL_PAGE", input);
+            assert_eq!(initial_page(), expected, "input: {input}");
+        }
+        std::env::remove_var("BACNET_REPUBLISHER_INITIAL_PAGE");
+    }
+
+    #[test]
+    fn initial_page_unknown_value_falls_back_to_overview() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BACNET_REPUBLISHER_INITIAL_PAGE", "unknown_page");
+        assert_eq!(initial_page(), Page::Overview);
+        std::env::remove_var("BACNET_REPUBLISHER_INITIAL_PAGE");
+    }
 }

@@ -1,4 +1,4 @@
-use crate::model::PointConfig;
+use crate::model::{default_true, PointConfig};
 use crate::topic::{telemetry_topic, validate_publish_topic};
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
@@ -146,6 +146,9 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Stamps the in-memory config with the current version number.
+    /// Call after deserializing from disk so that the version field is always
+    /// up-to-date when the config is subsequently saved.
     pub fn migrate(&mut self) {
         self.version = CURRENT_CONFIG_VERSION;
     }
@@ -323,10 +326,6 @@ pub fn save_to_path(path: &Path, config: &AppConfig) -> Result<()> {
     let raw =
         toml::to_string_pretty(&config.sanitized_for_save()).context("failed to encode config")?;
     fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_bacnet_port() -> u16 {

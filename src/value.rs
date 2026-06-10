@@ -49,14 +49,6 @@ pub fn decode_scalar_value(bytes: &[u8]) -> Result<TelemetryValue, DecodeError> 
     }
 }
 
-pub fn decode_object_identifier_value(bytes: &[u8]) -> Result<(ObjectType, u32), DecodeError> {
-    decode_object_id(bytes)
-}
-
-pub fn decode_unsigned_value(bytes: &[u8]) -> Result<u64, DecodeError> {
-    decode_unsigned(bytes)
-}
-
 pub fn property_identifier_from_text(value: &str) -> Option<PropertyIdentifier> {
     let normalized = normalize_identifier(value);
     if let Ok(raw) = normalized.parse::<u32>() {
@@ -96,7 +88,7 @@ pub fn object_type_name(object_type: ObjectType) -> String {
         .unwrap_or_else(|| object_type.to_raw().to_string())
 }
 
-pub fn hex(bytes: &[u8]) -> String {
+fn hex(bytes: &[u8]) -> String {
     let mut value = String::new();
     for byte in bytes {
         let _ = write!(&mut value, "{byte:02X}");
@@ -104,7 +96,7 @@ pub fn hex(bytes: &[u8]) -> String {
     value
 }
 
-fn decode_unsigned(bytes: &[u8]) -> Result<u64, DecodeError> {
+pub(crate) fn decode_unsigned(bytes: &[u8]) -> Result<u64, DecodeError> {
     let payload = application_payload(bytes)?;
     let mut value = 0u64;
     for byte in payload {
@@ -162,7 +154,7 @@ fn decode_character_string(bytes: &[u8]) -> Result<TelemetryValue, DecodeError> 
     }
 }
 
-fn decode_object_id(bytes: &[u8]) -> Result<(ObjectType, u32), DecodeError> {
+pub(crate) fn decode_object_id(bytes: &[u8]) -> Result<(ObjectType, u32), DecodeError> {
     let payload = application_payload(bytes)?;
     if payload.len() != 4 {
         return Err(DecodeError::Truncated);
@@ -232,5 +224,123 @@ mod tests {
             object_type_from_text("analog_input"),
             Some(ObjectType::ANALOG_INPUT)
         );
+    }
+
+    // --- decode_double (tag 5) ---
+
+    #[test]
+    fn decodes_double_value() {
+        // Tag 5 (double), length 8
+        let raw: f64 = 1234.5678;
+        let bits = raw.to_bits();
+        let bytes = bits.to_be_bytes();
+        let mut packet = vec![0x55u8, 0x08]; // tag=5, extended-length indicator (length_code=5 means next byte is length)
+                                             // Actually tag=5 uses length_code in lower 3 bits. 8 > 4 so length_code=5 (extended).
+                                             // Format: first byte = (tag<<4)|(5), second byte = actual length (8)
+                                             // first byte: (5 << 4) | 5 = 0x55, second byte: 8
+        packet.push(0x08);
+        packet.extend_from_slice(&bytes);
+        // Correct: first byte 0x55 = tag 5, length_code 5 = extended; second byte = 8
+        let packet = {
+            let mut v = Vec::new();
+            v.push((5u8 << 4) | 5u8); // tag=5, length_code=5 (extended)
+            v.push(8u8); // actual length
+            v.extend_from_slice(&bytes);
+            v
+        };
+        let result = decode_scalar_value(&packet).unwrap();
+        assert_eq!(result, TelemetryValue::Number(raw));
+    }
+
+    #[test]
+    fn decodes_double_truncated_returns_error() {
+        // tag=5, extended-length=8, but only 4 payload bytes
+        let mut packet = vec![(5u8 << 4) | 5u8, 8u8];
+        packet.extend_from_slice(&[0u8; 4]);
+        assert_eq!(decode_scalar_value(&packet), Err(DecodeError::Truncated));
+    }
+
+    // --- decode_signed negative path ---
+
+    #[test]
+    fn decodes_signed_negative_value() {
+        // Tag 3 (signed), value -1 encoded as 0xFF (1 byte)
+        let packet = vec![(3u8 << 4) | 1u8, 0xFFu8]; // tag=3, length=1, payload=0xFF
+        let result = decode_scalar_value(&packet).unwrap();
+        assert_eq!(result, TelemetryValue::Number(-1.0));
+    }
+
+    #[test]
+    fn decodes_signed_negative_two_bytes() {
+        // -256 in two's complement big-endian: 0xFF 0x00
+        let packet = vec![(3u8 << 4) | 2u8, 0xFF, 0x00];
+        let result = decode_scalar_value(&packet).unwrap();
+        assert_eq!(result, TelemetryValue::Number(-256.0));
+    }
+
+    #[test]
+    fn decodes_signed_zero_length_is_zero() {
+        // Tag 3, length 0 → value 0
+        let packet = vec![(3u8 << 4)];
+        let result = decode_scalar_value(&packet).unwrap();
+        assert_eq!(result, TelemetryValue::Number(0.0));
+    }
+
+    // --- decode_character_string non-UTF-8 fallback ---
+
+    #[test]
+    fn decodes_character_string_utf8() {
+        // Tag 7, encoding 0 (UTF-8), "hi"
+        let payload = b"hi";
+        let mut packet = vec![(7u8 << 4) | (1 + payload.len()) as u8, 0u8]; // encoding=0
+        packet.extend_from_slice(payload);
+        let result = decode_scalar_value(&packet).unwrap();
+        assert_eq!(result, TelemetryValue::Text("hi".to_string()));
+    }
+
+    #[test]
+    fn decodes_character_string_non_utf8_encoding_returns_hex() {
+        // Tag 7, encoding 1 (UCS-2), two bytes 0xAB 0xCD
+        let data: &[u8] = &[0xAB, 0xCD];
+        let length = 1 + data.len(); // encoding byte + data
+        let mut packet = vec![(7u8 << 4) | length as u8, 0x01u8]; // encoding=1 (UCS-2)
+        packet.extend_from_slice(data);
+        let result = decode_scalar_value(&packet).unwrap();
+        // Should fall back to hex representation
+        assert_eq!(result, TelemetryValue::Text("ABCD".to_string()));
+    }
+
+    #[test]
+    fn decodes_empty_character_string() {
+        // Tag 7, length 0
+        let packet = vec![(7u8 << 4)];
+        let result = decode_scalar_value(&packet).unwrap();
+        assert_eq!(result, TelemetryValue::Text(String::new()));
+    }
+
+    // --- object_type_from_text with raw numeric string ---
+
+    #[test]
+    fn object_type_from_text_raw_zero() {
+        // ObjectType 0 = ANALOG_INPUT
+        let result = object_type_from_text("0");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), ObjectType::ANALOG_INPUT);
+    }
+
+    #[test]
+    fn object_type_from_text_raw_numeric() {
+        // ObjectType 1 = ANALOG_OUTPUT
+        let result = object_type_from_text("1");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), ObjectType::ANALOG_OUTPUT);
+    }
+
+    #[test]
+    fn property_identifier_from_text_raw_numeric() {
+        // PropertyIdentifier 85 = PRESENT_VALUE
+        let result = property_identifier_from_text("85");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), PropertyIdentifier::PRESENT_VALUE);
     }
 }
