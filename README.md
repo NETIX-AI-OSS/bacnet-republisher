@@ -40,6 +40,8 @@ Optional repository variable:
 
 Tag a release as `v*` to build, sign, verify, zip, and publish the Windows executable.
 
+Release assets are the platform zip files (`bacnet-republisher-<tag>-windows-x86_64.zip` and `...-linux-x86_64.zip`), not GitHub's auto-generated "Source code" archives. Extract the zip and run `bacnet-republisher.exe` (Windows) or `bacnet-republisher` (Linux). Windows builds statically link the MSVC runtime, so the Visual C++ Redistributable is not required.
+
 ## Development
 
 ```bash

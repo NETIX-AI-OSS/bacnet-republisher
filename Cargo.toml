@@ -17,7 +17,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 crossbeam-channel = "0.5"
 directories = "6.0"
 get_if_addrs = "0.5"
-iced = { version = "0.14", features = ["tokio", "svg"] }
+iced = { version = "0.14", features = ["image", "tokio", "svg"] }
 rumqttc = "0.25.1"
 rustls-native-certs = "0.8"
 rustls-pemfile = "2.2"

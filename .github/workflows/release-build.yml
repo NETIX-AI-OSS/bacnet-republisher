@@ -93,6 +93,8 @@ jobs:
         run: cargo test --locked
 
       - name: Build release
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
         run: cargo build --locked --release
 
       - name: Package executable

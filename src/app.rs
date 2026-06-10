@@ -297,6 +297,7 @@ impl BacnetRepublisher {
             .window(window::Settings {
                 size: Size::new(1180.0, 760.0),
                 min_size: Some(Size::new(920.0, 620.0)),
+                icon: window_icon(),
                 ..window::Settings::default()
             })
             .antialiasing(true)
@@ -2090,6 +2091,10 @@ fn empty_state<'a>(
     .width(Length::Fill)
     .style(move |_| ui::row_style(palette))
     .into()
+}
+
+fn window_icon() -> Option<window::Icon> {
+    window::icon::from_file_data(include_bytes!("../assets/app-icon.png"), None).ok()
 }
 
 fn page_icon(page: Page) -> Icon {
