@@ -1,0 +1,8 @@
+BACnet Republisher
+Copyright 2026 NETIX
+
+This product includes software developed as part of the rusty-bacnet
+project (https://github.com/jscott3201/rusty-bacnet), licensed under the
+MIT License. A patched copy of the bacnet-transport crate is vendored at
+vendor/bacnet-transport; see vendor/bacnet-transport/LICENSE for its
+license text.
