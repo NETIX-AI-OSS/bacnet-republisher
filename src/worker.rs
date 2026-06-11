@@ -30,7 +30,17 @@ pub enum WorkerEvent {
     Samples(Vec<PointSample>),
     Failures(Vec<PointFailure>),
     PublishStatus(PublishStats),
+    RepublisherLifecycle(RepublisherLifecycle),
     Finished(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepublisherLifecycle {
+    Starting,
+    Running,
+    Stopping,
+    Stopped,
+    Failed(String),
 }
 
 pub fn spawn_discovery(
@@ -345,7 +355,15 @@ pub fn spawn_republisher(
     stop: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
-        run_async(sender.clone(), async move {
+        let runtime_sender = sender.clone();
+        let future_sender = sender.clone();
+        let runtime_started = run_async(runtime_sender, async move {
+            let sender = future_sender;
+            sender
+                .send(WorkerEvent::RepublisherLifecycle(
+                    RepublisherLifecycle::Starting,
+                ))
+                .ok();
             sender
                 .send(WorkerEvent::Log(
                     LogLevel::Info,
@@ -359,15 +377,13 @@ pub fn spawn_republisher(
             let mut publisher = match RumqttPublisher::new(&mqtt) {
                 Ok(publisher) => publisher,
                 Err(error) => {
+                    let message = format!("MQTT publisher setup failed: {error:#}");
                     sender
-                        .send(WorkerEvent::Log(
-                            LogLevel::Error,
-                            format!("MQTT publisher setup failed: {error:#}"),
-                        ))
+                        .send(WorkerEvent::Log(LogLevel::Error, message.clone()))
                         .ok();
                     sender
-                        .send(WorkerEvent::Finished(
-                            "Continuous republisher failed".to_string(),
+                        .send(WorkerEvent::RepublisherLifecycle(
+                            RepublisherLifecycle::Failed(message),
                         ))
                         .ok();
                     return;
@@ -381,20 +397,23 @@ pub fn spawn_republisher(
             let mut client = match build_client(&bacnet, bind).await {
                 Ok(c) => c,
                 Err(error) => {
+                    let message = format!("Failed to start BACnet client: {error:#}");
                     sender
-                        .send(WorkerEvent::Log(
-                            LogLevel::Error,
-                            format!("Failed to start BACnet client: {error:#}"),
-                        ))
+                        .send(WorkerEvent::Log(LogLevel::Error, message.clone()))
                         .ok();
                     sender
-                        .send(WorkerEvent::Finished(
-                            "Continuous republisher failed".to_string(),
+                        .send(WorkerEvent::RepublisherLifecycle(
+                            RepublisherLifecycle::Failed(message),
                         ))
                         .ok();
                     return;
                 }
             };
+            sender
+                .send(WorkerEvent::RepublisherLifecycle(
+                    RepublisherLifecycle::Running,
+                ))
+                .ok();
             let unique_device_instances = points
                 .iter()
                 .filter(|p| p.enabled)
@@ -505,13 +524,30 @@ pub fn spawn_republisher(
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
 
+            sender
+                .send(WorkerEvent::RepublisherLifecycle(
+                    RepublisherLifecycle::Stopping,
+                ))
+                .ok();
             client.stop().await.ok();
+            sender
+                .send(WorkerEvent::RepublisherLifecycle(
+                    RepublisherLifecycle::Stopped,
+                ))
+                .ok();
             sender
                 .send(WorkerEvent::Finished(
                     "Continuous republisher stopped".to_string(),
                 ))
                 .ok();
         });
+        if !runtime_started {
+            sender
+                .send(WorkerEvent::RepublisherLifecycle(
+                    RepublisherLifecycle::Failed("Failed to start async runtime".to_string()),
+                ))
+                .ok();
+        }
     });
 }
 
@@ -573,7 +609,7 @@ async fn emit_poll_outcome(
     )
 }
 
-fn run_async<F>(sender: Sender<WorkerEvent>, future: F)
+fn run_async<F>(sender: Sender<WorkerEvent>, future: F) -> bool
 where
     F: std::future::Future<Output = ()>,
 {
@@ -581,14 +617,18 @@ where
         .enable_all()
         .build()
     {
-        Ok(runtime) => runtime.block_on(future),
+        Ok(runtime) => {
+            runtime.block_on(future);
+            true
+        }
         Err(error) => {
             sender
                 .send(WorkerEvent::Log(
                     LogLevel::Error,
-                    format!("Failed to start async runtime: {error}"),
+                    format!("Failed to start async runtime: {error:#}"),
                 ))
                 .ok();
+            false
         }
     }
 }
