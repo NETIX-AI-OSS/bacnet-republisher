@@ -35,3 +35,10 @@ tempfile = "3.23"
 
 [build-dependencies]
 winresource = "0.1"
+
+# Vendored with a fix: broadcast destination port stays 47808 when the local
+# bind port is ephemeral (port = 0). Upstream sends broadcasts to the local
+# bind port, which breaks Who-Is discovery from an ephemeral-port client.
+# See vendor/bacnet-transport/src/bip/mod.rs (broadcast_port).
+[patch.crates-io]
+bacnet-transport = { path = "vendor/bacnet-transport" }

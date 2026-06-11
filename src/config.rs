@@ -8,7 +8,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 const CONFIG_FILE_NAME: &str = "config.toml";
-pub const CURRENT_CONFIG_VERSION: u32 = 2;
+pub const CURRENT_CONFIG_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
@@ -146,10 +146,14 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// Stamps the in-memory config with the current version number.
-    /// Call after deserializing from disk so that the version field is always
-    /// up-to-date when the config is subsequently saved.
+    /// Stamps the in-memory config with the current version number and applies
+    /// one-time upgrades from older saved configs.
     pub fn migrate(&mut self) {
+        if self.version < 3 && self.bacnet.port == default_bacnet_device_port() {
+            // Ephemeral local port avoids UDP/47808 conflicts with a BACnet device or
+            // simulator bound on the same host (common on Windows co-hosted setups).
+            self.bacnet.port = 0;
+        }
         self.version = CURRENT_CONFIG_VERSION;
     }
 
@@ -163,9 +167,6 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.bacnet.port == 0 {
-            return Err("BACnet port cannot be 0 for discovery".to_string());
-        }
         if self.bacnet.discovery_window_ms < 250 {
             return Err("BACnet discovery window must be at least 250 ms".to_string());
         }
@@ -235,7 +236,7 @@ impl Default for BacnetConfig {
     fn default() -> Self {
         Self {
             selected_interface: None,
-            discover_all_interfaces: true,
+            discover_all_interfaces: false,
             port: default_bacnet_port(),
             broadcast_address: default_broadcast_address(),
             discovery_window_ms: default_discovery_window_ms(),
@@ -328,7 +329,13 @@ pub fn save_to_path(path: &Path, config: &AppConfig) -> Result<()> {
     fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))
 }
 
+/// Local UDP bind port for the BACnet client. `0` lets the OS assign an ephemeral
+/// port so I-Am responses are not stolen by another process listening on 47808.
 fn default_bacnet_port() -> u16 {
+    0
+}
+
+fn default_bacnet_device_port() -> u16 {
     0xBAC0
 }
 
@@ -468,6 +475,7 @@ theme = "auto"
         config.migrate();
 
         assert_eq!(config.version, CURRENT_CONFIG_VERSION);
+        assert_eq!(config.bacnet.port, 0);
         assert_eq!(config.mqtt.ca_cert_path, None);
         assert_eq!(config.mqtt.client_cert_path, None);
         assert_eq!(config.mqtt.client_key_path, None);
@@ -481,6 +489,13 @@ theme = "auto"
             config.discovery_bind_failure_policy,
             DiscoveryBindFailurePolicy::Skip
         );
+    }
+
+    #[test]
+    fn default_bacnet_client_uses_ephemeral_bind_port() {
+        let config = BacnetConfig::default();
+        assert_eq!(config.port, 0);
+        assert!(!config.discover_all_interfaces);
     }
 
     #[test]

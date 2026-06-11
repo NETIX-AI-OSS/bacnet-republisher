@@ -371,6 +371,7 @@ impl BacnetRepublisher {
             }
             Message::InterfaceSelected(addr) => {
                 self.config.bacnet.selected_interface = Some(addr);
+                self.config.bacnet.discover_all_interfaces = false;
                 self.save_config_with_status();
             }
             Message::Discover => self.start_discovery(),
@@ -716,24 +717,35 @@ impl BacnetRepublisher {
                 .align_y(Alignment::Center),
                 data_row(
                     palette,
-                    row![
-                        checkbox(self.config.bacnet.discover_all_interfaces)
-                            .label("All interfaces")
-                            .on_toggle(Message::DiscoverAllInterfacesChanged),
-                        pick_list(
-                            self.interface_choices.clone(),
-                            self.config.bacnet.selected_interface,
-                            Message::InterfaceSelected
-                        )
-                        .placeholder("Bind interface"),
-                        ui::field_readout(
+                    column![
+                        row![
+                            checkbox(self.config.bacnet.discover_all_interfaces)
+                                .label("All interfaces")
+                                .on_toggle(Message::DiscoverAllInterfacesChanged),
+                            pick_list(
+                                self.interface_choices.clone(),
+                                self.config.bacnet.selected_interface,
+                                Message::InterfaceSelected
+                            )
+                            .placeholder("Bind interface"),
+                            ui::field_readout(
+                                palette,
+                                "Bind policy",
+                                self.settings.discovery_bind_failure_policy.to_string()
+                            ),
+                        ]
+                        .spacing(12)
+                        .align_y(Alignment::Center),
+                        ui::muted(
                             palette,
-                            "Bind policy",
-                            self.settings.discovery_bind_failure_policy.to_string()
+                            if self.config.bacnet.discover_all_interfaces {
+                                "All interfaces ignores the bind picker. Select an interface to switch to single-NIC discovery."
+                            } else {
+                                "Discovery and polling use the selected bind interface."
+                            }
                         ),
                     ]
-                    .spacing(12)
-                    .align_y(Alignment::Center),
+                    .spacing(6),
                 ),
             ]
             .spacing(12),
@@ -1259,8 +1271,8 @@ impl BacnetRepublisher {
                 row![
                     ui::labeled_input(
                         palette,
-                        "Port",
-                        "Default 47808",
+                        "Local bind port",
+                        "0 = ephemeral (recommended)",
                         &self.settings.bacnet_port,
                         Message::BacnetPortChanged
                     ),

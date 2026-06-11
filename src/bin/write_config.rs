@@ -6,7 +6,8 @@ use bacnet_republisher::seed::simulator_points;
 fn main() -> anyhow::Result<()> {
     let path = bacnet_republisher::config::config_path()?;
     let mut config = AppConfig::default();
-    config.bacnet.discover_all_interfaces = true;
+    config.bacnet.discover_all_interfaces = false;
+    config.bacnet.port = 0;
     config.bacnet.discovery_bind_failure_policy = DiscoveryBindFailurePolicy::Skip;
     config.mqtt.use_tls = false;
     config.mqtt.port = 1883;

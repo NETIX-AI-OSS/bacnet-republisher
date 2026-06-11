@@ -542,6 +542,8 @@ pub(crate) async fn build_client(
     config: &BacnetConfig,
     interface: Ipv4Addr,
 ) -> Result<BacnetIpClient> {
+    // Port 0 binds an ephemeral UDP port so I-Am unicasts are not captured by another
+    // BACnet stack (e.g. a local simulator) listening on 47808.
     let mut transport = BipTransport::new(interface, config.port, config.broadcast_address);
     if let Some(bbmd) = &config.bbmd {
         transport.register_as_foreign_device(ForeignDeviceConfig {

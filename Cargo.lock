@@ -452,8 +452,6 @@ dependencies = [
 [[package]]
 name = "bacnet-transport"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "325797ceeb3298e59a1ed3276198d583d0394e1e97c67be6d017b7c9d212c23f"
 dependencies = [
  "bacnet-encoding",
  "bacnet-types",
