@@ -9,15 +9,15 @@ use crate::network::{interface_choices, ipv4_interfaces};
 use crate::ui::{self, ButtonKind, ChipKind, Icon};
 use crate::worker::{
     spawn_discovery, spawn_object_scan, spawn_poll_and_publish, spawn_republisher,
-    spawn_scan_all_objects, WorkerEvent,
+    spawn_scan_all_objects, RepublisherLifecycle, WorkerEvent,
 };
 use chrono::{DateTime, Local, Utc};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use iced::widget::{
     checkbox, column, container, pick_list, progress_bar, row, scrollable, text, Column,
 };
-use iced::{theme, window, Alignment, Element, Length, Size, Subscription, Task, Theme};
-use std::collections::HashMap;
+use iced::{theme, window, Alignment, Element, Font, Length, Size, Subscription, Task, Theme};
+use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -27,6 +27,8 @@ use std::sync::{
 use std::time::Duration;
 
 const LOG_CAPACITY: usize = 500;
+const RECENT_SAMPLE_CAPACITY: usize = 100;
+const UI_FONT: Font = Font::with_name("Fira Sans");
 
 pub struct BacnetRepublisher {
     config: AppConfig,
@@ -37,7 +39,9 @@ pub struct BacnetRepublisher {
     devices: Vec<DiscoveredDevice>,
     scanned_objects: Vec<DeviceObject>,
     scan_progress: Option<(usize, usize)>,
-    samples: Vec<PointSample>,
+    latest_samples: HashMap<PointIdentity, PointSample>,
+    recent_samples: VecDeque<PointSample>,
+    last_sample_batch: Vec<PointIdentity>,
     point_statuses: HashMap<PointIdentity, PointStatus>,
     status: String,
     status_level: LogLevel,
@@ -48,7 +52,7 @@ pub struct BacnetRepublisher {
     worker_receiver: Receiver<WorkerEvent>,
     logs: LogBuffer,
     working: bool,
-    republishing: bool,
+    republisher_state: RepublisherLifecycle,
     republisher_stop: Option<Arc<AtomicBool>>,
 }
 
@@ -294,6 +298,7 @@ impl BacnetRepublisher {
             .subscription(Self::subscription)
             .theme(Self::theme)
             .style(Self::app_style)
+            .default_font(UI_FONT)
             .window(window::Settings {
                 size: Size::new(1180.0, 760.0),
                 min_size: Some(Size::new(920.0, 620.0)),
@@ -324,7 +329,9 @@ impl BacnetRepublisher {
                 devices: Vec::new(),
                 scanned_objects: Vec::new(),
                 scan_progress: None,
-                samples: Vec::new(),
+                latest_samples: HashMap::new(),
+                recent_samples: VecDeque::new(),
+                last_sample_batch: Vec::new(),
                 point_statuses: HashMap::new(),
                 status,
                 status_level: LogLevel::Info,
@@ -333,7 +340,7 @@ impl BacnetRepublisher {
                 worker_receiver,
                 logs,
                 working: false,
-                republishing: false,
+                republisher_state: RepublisherLifecycle::Stopped,
                 republisher_stop: None,
             },
             Task::none(),
@@ -453,16 +460,8 @@ impl BacnetRepublisher {
                 ui::brand(),
                 ui::chip(
                     palette,
-                    if self.republishing {
-                        "LIVE REPUBLISH"
-                    } else {
-                        "STANDBY"
-                    },
-                    if self.republishing {
-                        ChipKind::Success
-                    } else {
-                        ChipKind::Neutral
-                    }
+                    self.republisher_sidebar_label(),
+                    self.republisher_chip_kind()
                 ),
                 iced::widget::rule::horizontal(1),
                 self.nav_button(Page::Overview),
@@ -520,7 +519,7 @@ impl BacnetRepublisher {
 
     fn overview_page(&self) -> Element<'_, Message> {
         let palette = self.palette();
-        let publish_kind = if self.republishing {
+        let publish_kind = if self.republisher_active() {
             ChipKind::Success
         } else if self.enabled_point_count() == 0 {
             ChipKind::Warning
@@ -533,11 +532,7 @@ impl BacnetRepublisher {
             ui::metric(
                 palette,
                 "Republisher",
-                if self.republishing {
-                    "Running"
-                } else {
-                    "Stopped"
-                },
+                self.republisher_mode_label(),
                 format!("{} enabled point(s)", self.enabled_point_count()),
                 publish_kind
             ),
@@ -551,7 +546,7 @@ impl BacnetRepublisher {
             ui::metric(
                 palette,
                 "Samples",
-                self.samples.len().to_string(),
+                self.recent_samples.len().to_string(),
                 last_state,
                 self.overall_point_kind()
             ),
@@ -570,11 +565,7 @@ impl BacnetRepublisher {
                     ui::action_button(
                         palette,
                         Icon::Start,
-                        if self.republishing {
-                            "Running"
-                        } else {
-                            "Start republisher"
-                        },
+                        self.republisher_start_label(),
                         ButtonKind::Secondary
                     )
                     .on_press(Message::StartRepublisher),
@@ -996,6 +987,7 @@ impl BacnetRepublisher {
             for (index, point) in self.config.points.iter().enumerate() {
                 let (kind, label) = self.point_status_chip(point);
                 let live_value = self.live_value_text(point);
+                let last_sampled = self.last_sampled_text(point);
                 list = list.push(data_row(
                     palette,
                     column![
@@ -1031,6 +1023,7 @@ impl BacnetRepublisher {
                                 3
                             ),
                             readout(palette, "Live value", live_value, 1),
+                            readout(palette, "Last sampled", last_sampled, 1),
                             readout(
                                 palette,
                                 "Poll interval",
@@ -1059,21 +1052,9 @@ impl BacnetRepublisher {
             ui::metric(
                 palette,
                 "Mode",
-                if self.republishing {
-                    "Running"
-                } else {
-                    "Manual"
-                },
-                if self.republishing {
-                    "Continuous republisher active"
-                } else {
-                    "Poll once or start loop"
-                },
-                if self.republishing {
-                    ChipKind::Success
-                } else {
-                    ChipKind::Accent
-                }
+                self.republisher_mode_label(),
+                self.republisher_mode_hint(),
+                self.republisher_chip_kind()
             ),
             ui::metric(
                 palette,
@@ -1088,23 +1069,73 @@ impl BacnetRepublisher {
             ),
             ui::metric(
                 palette,
-                "Samples",
-                self.samples.len().to_string(),
-                self.last_point_state(),
+                "Last update",
+                self.last_update_text(),
+                format!("{} recent sample(s)", self.recent_samples.len()),
                 self.overall_point_kind()
             ),
         ]
         .spacing(14);
 
-        let mut samples = column![ui::section_title(palette, "Last samples")].spacing(8);
-        if self.samples.is_empty() {
+        let mut live_points = column![ui::section_title(palette, "Live points")].spacing(8);
+        let enabled_points = self
+            .config
+            .points
+            .iter()
+            .filter(|point| point.enabled)
+            .collect::<Vec<_>>();
+        if enabled_points.is_empty() {
+            live_points = live_points.push(empty_state(
+                palette,
+                "No enabled points.",
+                "Enable at least one point to show live republished values.",
+            ));
+        } else {
+            for point in enabled_points {
+                let (kind, label) = self.point_status_chip(point);
+                live_points = live_points.push(data_row(
+                    palette,
+                    column![
+                        row![
+                            column![
+                                text(point.display_name()).size(15).color(palette.text),
+                                text(format!("Device #{}", point.device_instance))
+                                    .size(12)
+                                    .color(palette.subtle)
+                            ]
+                            .spacing(3)
+                            .width(Length::Fill),
+                            ui::chip(palette, label, kind),
+                        ]
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                        row![
+                            readout(palette, "Live value", self.live_value_text(point), 1),
+                            readout(palette, "Last sampled", self.last_sampled_text(point), 1),
+                            readout(
+                                palette,
+                                "Poll interval",
+                                format!("{}s", point.poll_interval_secs),
+                                1
+                            ),
+                        ]
+                        .spacing(12)
+                        .align_y(Alignment::Center),
+                    ]
+                    .spacing(10),
+                ));
+            }
+        }
+
+        let mut samples = column![ui::section_title(palette, "Recent samples")].spacing(8);
+        if self.recent_samples.is_empty() {
             samples = samples.push(empty_state(
                 palette,
                 "No point samples published yet.",
                 "Use Discover → Scan all to seed points, then poll or start the republisher.",
             ));
         } else {
-            for sample in self.samples.iter().rev().take(20) {
+            for sample in self.recent_samples.iter().rev().take(20) {
                 samples = samples.push(data_row(
                     palette,
                     row![
@@ -1125,16 +1156,8 @@ impl BacnetRepublisher {
                     ui::section_title(palette, "MQTT target"),
                     ui::chip(
                         palette,
-                        if self.republishing {
-                            "Publishing"
-                        } else {
-                            "Idle"
-                        },
-                        if self.republishing {
-                            ChipKind::Success
-                        } else {
-                            ChipKind::Neutral
-                        }
+                        self.republisher_mode_label(),
+                        self.republisher_chip_kind()
                     )
                 ]
                 .spacing(10)
@@ -1172,11 +1195,7 @@ impl BacnetRepublisher {
                     ui::action_button(
                         palette,
                         Icon::Start,
-                        if self.republishing {
-                            "Republishing"
-                        } else {
-                            "Start"
-                        },
+                        self.republisher_start_label(),
                         ButtonKind::Secondary
                     )
                     .on_press(Message::StartRepublisher),
@@ -1201,7 +1220,13 @@ impl BacnetRepublisher {
         self.page_shell(
             "Republish",
             "Poll configured BACnet points and publish scalar MQTT values.",
-            column![publish_metrics, summary, ui::card(palette, samples)].spacing(16),
+            column![
+                publish_metrics,
+                summary,
+                ui::card(palette, live_points),
+                ui::card(palette, samples)
+            ]
+            .spacing(16),
         )
     }
 
@@ -1565,6 +1590,25 @@ impl BacnetRepublisher {
         body: Column<'a, Message>,
     ) -> Element<'a, Message> {
         let palette = self.palette();
+        let mut state_chips = row![ui::chip(
+            palette,
+            if self.working { "Working" } else { "Ready" },
+            if self.working {
+                ChipKind::Warning
+            } else {
+                ChipKind::Success
+            }
+        )]
+        .spacing(8);
+        if self.republisher_active()
+            || matches!(self.republisher_state, RepublisherLifecycle::Failed(_))
+        {
+            state_chips = state_chips.push(ui::chip(
+                palette,
+                self.republisher_mode_label(),
+                self.republisher_chip_kind(),
+            ));
+        }
         let header = row![
             column![
                 ui::eyebrow(palette, "BACNET REPUBLISHER"),
@@ -1573,15 +1617,7 @@ impl BacnetRepublisher {
             ]
             .spacing(4)
             .width(Length::Fill),
-            ui::chip(
-                palette,
-                if self.working { "Working" } else { "Ready" },
-                if self.working {
-                    ChipKind::Warning
-                } else {
-                    ChipKind::Success
-                }
-            )
+            state_chips
         ]
         .spacing(16)
         .align_y(Alignment::Center);
@@ -1653,7 +1689,7 @@ impl BacnetRepublisher {
     }
 
     fn start_poll_and_publish(&mut self) {
-        if self.republishing {
+        if self.republisher_active() {
             self.set_status(
                 LogLevel::Warning,
                 "Stop the continuous republisher before running Poll once",
@@ -1682,7 +1718,7 @@ impl BacnetRepublisher {
     }
 
     fn start_republisher(&mut self) {
-        if self.republishing {
+        if self.republisher_active() {
             self.set_status(
                 LogLevel::Warning,
                 "Continuous republisher is already running",
@@ -1703,7 +1739,7 @@ impl BacnetRepublisher {
 
         let stop = Arc::new(AtomicBool::new(false));
         self.republisher_stop = Some(Arc::clone(&stop));
-        self.republishing = true;
+        self.republisher_state = RepublisherLifecycle::Starting;
         spawn_republisher(
             self.worker_sender.clone(),
             self.config.bacnet.clone(),
@@ -1717,12 +1753,11 @@ impl BacnetRepublisher {
     fn stop_republisher(&mut self) {
         if let Some(stop) = &self.republisher_stop {
             stop.store(true, Ordering::Relaxed);
+            self.republisher_state = RepublisherLifecycle::Stopping;
             self.set_status(LogLevel::Info, "Stopping continuous republisher");
         } else {
             self.set_status(LogLevel::Warning, "Continuous republisher is not running");
         }
-        self.republisher_stop = None;
-        self.republishing = false;
     }
 
     fn add_object_as_point(&mut self, index: usize) {
@@ -1821,11 +1856,8 @@ impl BacnetRepublisher {
                         .last_error
                         .clone()
                         .unwrap_or_else(|| "MQTT publish failed".to_string());
-                    for sample in &self.samples {
-                        let status = self
-                            .point_statuses
-                            .entry(PointIdentity::from_point(&sample.point))
-                            .or_default();
+                    for identity in &self.last_sample_batch {
+                        let status = self.point_statuses.entry(identity.clone()).or_default();
                         if stats.failed == 0 {
                             status.record_publish_success();
                         } else {
@@ -1844,27 +1876,65 @@ impl BacnetRepublisher {
                         ),
                     );
                 }
+                WorkerEvent::RepublisherLifecycle(state) => self.apply_republisher_lifecycle(state),
                 WorkerEvent::Finished(message) => {
                     self.working = false;
                     self.scan_progress = None;
-                    if message.contains("republisher stopped") {
-                        self.republishing = false;
-                        self.republisher_stop = None;
-                    }
                     self.set_status(LogLevel::Info, message);
                 }
             }
         }
     }
 
-    fn record_samples(&mut self, samples: Vec<PointSample>) {
-        for sample in &samples {
-            self.point_statuses
-                .entry(PointIdentity::from_point(&sample.point))
-                .or_default()
-                .record_sample(sample);
+    fn apply_republisher_lifecycle(&mut self, state: RepublisherLifecycle) {
+        if matches!(self.republisher_state, RepublisherLifecycle::Stopping)
+            && matches!(
+                state,
+                RepublisherLifecycle::Starting | RepublisherLifecycle::Running
+            )
+        {
+            return;
         }
-        self.samples = samples;
+        match &state {
+            RepublisherLifecycle::Starting => {
+                self.set_status(LogLevel::Info, "Starting continuous republisher");
+            }
+            RepublisherLifecycle::Running => {
+                self.set_status(LogLevel::Info, "Continuous republisher active");
+            }
+            RepublisherLifecycle::Stopping => {
+                self.set_status(LogLevel::Info, "Stopping continuous republisher");
+            }
+            RepublisherLifecycle::Stopped => {
+                self.republisher_stop = None;
+                self.set_status(LogLevel::Info, "Continuous republisher stopped");
+            }
+            RepublisherLifecycle::Failed(reason) => {
+                self.republisher_stop = None;
+                self.set_status(
+                    LogLevel::Error,
+                    format!("Continuous republisher failed: {reason}"),
+                );
+            }
+        }
+        self.republisher_state = state;
+    }
+
+    fn record_samples(&mut self, samples: Vec<PointSample>) {
+        self.last_sample_batch.clear();
+        for sample in samples {
+            let identity = PointIdentity::from_point(&sample.point);
+            self.point_statuses
+                .entry(identity.clone())
+                .or_default()
+                .record_sample(&sample);
+            self.latest_samples.insert(identity.clone(), sample.clone());
+            self.recent_samples.push_back(sample);
+            self.last_sample_batch.push(identity);
+        }
+        while self.recent_samples.len() > RECENT_SAMPLE_CAPACITY {
+            self.recent_samples.pop_front();
+        }
     }
 
     fn live_value_text(&self, point: &PointConfig) -> String {
@@ -1875,6 +1945,14 @@ impl BacnetRepublisher {
             Some(value) => value.to_string(),
             None => "—".to_string(),
         }
+    }
+
+    fn last_sampled_text(&self, point: &PointConfig) -> String {
+        self.point_statuses
+            .get(&PointIdentity::from_point(point))
+            .and_then(|status| status.last_sample_ms)
+            .map(format_timestamp)
+            .unwrap_or_else(|| "No sample".to_string())
     }
 
     fn point_status_chip(&self, point: &PointConfig) -> (ChipKind, String) {
@@ -1912,7 +1990,7 @@ impl BacnetRepublisher {
             .any(|status| status.stale || status.last_publish_error.is_some())
         {
             ChipKind::Warning
-        } else if self.samples.is_empty() {
+        } else if self.latest_samples.is_empty() {
             ChipKind::Neutral
         } else {
             ChipKind::Success
@@ -1920,7 +1998,7 @@ impl BacnetRepublisher {
     }
 
     fn last_point_state(&self) -> String {
-        if let Some(sample) = self.samples.last() {
+        if let Some(sample) = self.recent_samples.back() {
             format!(
                 "{} at {}",
                 sample.value,
@@ -1956,6 +2034,72 @@ impl BacnetRepublisher {
             .iter()
             .filter(|point| point.enabled)
             .count()
+    }
+
+    fn republisher_active(&self) -> bool {
+        matches!(
+            self.republisher_state,
+            RepublisherLifecycle::Starting
+                | RepublisherLifecycle::Running
+                | RepublisherLifecycle::Stopping
+        )
+    }
+
+    fn republisher_sidebar_label(&self) -> &'static str {
+        match self.republisher_state {
+            RepublisherLifecycle::Starting => "STARTING",
+            RepublisherLifecycle::Running => "LIVE REPUBLISH",
+            RepublisherLifecycle::Stopping => "STOPPING",
+            RepublisherLifecycle::Stopped => "STANDBY",
+            RepublisherLifecycle::Failed(_) => "FAILED",
+        }
+    }
+
+    fn republisher_mode_label(&self) -> String {
+        match &self.republisher_state {
+            RepublisherLifecycle::Starting => "Starting".to_string(),
+            RepublisherLifecycle::Running => "Running".to_string(),
+            RepublisherLifecycle::Stopping => "Stopping".to_string(),
+            RepublisherLifecycle::Stopped => "Stopped".to_string(),
+            RepublisherLifecycle::Failed(_) => "Failed".to_string(),
+        }
+    }
+
+    fn republisher_mode_hint(&self) -> String {
+        match &self.republisher_state {
+            RepublisherLifecycle::Starting => "Preparing MQTT and BACnet clients".to_string(),
+            RepublisherLifecycle::Running => "Continuous republisher active".to_string(),
+            RepublisherLifecycle::Stopping => "Waiting for current loop to exit".to_string(),
+            RepublisherLifecycle::Stopped => "Poll once or start loop".to_string(),
+            RepublisherLifecycle::Failed(reason) => reason.clone(),
+        }
+    }
+
+    fn republisher_start_label(&self) -> &'static str {
+        match self.republisher_state {
+            RepublisherLifecycle::Starting => "Starting",
+            RepublisherLifecycle::Running => "Running",
+            RepublisherLifecycle::Stopping => "Stopping",
+            RepublisherLifecycle::Stopped => "Start republisher",
+            RepublisherLifecycle::Failed(_) => "Restart republisher",
+        }
+    }
+
+    fn republisher_chip_kind(&self) -> ChipKind {
+        match self.republisher_state {
+            RepublisherLifecycle::Starting => ChipKind::Warning,
+            RepublisherLifecycle::Running => ChipKind::Success,
+            RepublisherLifecycle::Stopping => ChipKind::Warning,
+            RepublisherLifecycle::Stopped => ChipKind::Neutral,
+            RepublisherLifecycle::Failed(_) => ChipKind::Danger,
+        }
+    }
+
+    fn last_update_text(&self) -> String {
+        self.recent_samples
+            .back()
+            .map(|sample| format_timestamp(sample.timestamp_ms))
+            .unwrap_or_else(|| "No samples".to_string())
     }
 
     fn set_status(&mut self, level: LogLevel, message: impl Into<String>) {
@@ -2062,6 +2206,109 @@ impl BacnetRepublisher {
 
     fn palette(&self) -> ui::Palette {
         ui::palette(self.config.ui.theme)
+    }
+}
+
+#[cfg(test)]
+mod sample_state_tests {
+    use super::*;
+    use crate::model::TelemetryValue;
+
+    fn app_for_tests() -> BacnetRepublisher {
+        let config = AppConfig::default();
+        let (worker_sender, worker_receiver) = unbounded();
+        BacnetRepublisher {
+            settings: SettingsDraft::from_config(&config),
+            point_editor: PointEditor::new(),
+            config,
+            config_path: PathBuf::from("test-config.toml"),
+            selected_page: Page::Overview,
+            interfaces: Vec::new(),
+            interface_choices: Vec::new(),
+            devices: Vec::new(),
+            scanned_objects: Vec::new(),
+            scan_progress: None,
+            latest_samples: HashMap::new(),
+            recent_samples: VecDeque::new(),
+            last_sample_batch: Vec::new(),
+            point_statuses: HashMap::new(),
+            status: String::new(),
+            status_level: LogLevel::Info,
+            selected_point: None,
+            worker_sender,
+            worker_receiver,
+            logs: LogBuffer::new(LOG_CAPACITY),
+            working: false,
+            republisher_state: RepublisherLifecycle::Stopped,
+            republisher_stop: None,
+        }
+    }
+
+    fn point(object_instance: u32) -> PointConfig {
+        PointConfig {
+            device_instance: 100,
+            object_instance,
+            ..PointConfig::default()
+        }
+    }
+
+    fn sample(point: PointConfig, value: f64, timestamp_ms: i64) -> PointSample {
+        PointSample {
+            topic: format!(
+                "Netix/Site/device_100/analog_input_{}/present_value",
+                point.object_instance
+            ),
+            point,
+            value: TelemetryValue::Number(value),
+            timestamp_ms,
+        }
+    }
+
+    #[test]
+    fn record_samples_keeps_latest_value_for_each_point() {
+        let mut app = app_for_tests();
+        let point_a = point(1);
+        let point_b = point(2);
+
+        app.record_samples(vec![sample(point_a.clone(), 10.0, 100)]);
+        app.record_samples(vec![sample(point_b.clone(), 20.0, 200)]);
+
+        let identity_a = PointIdentity::from_point(&point_a);
+        let identity_b = PointIdentity::from_point(&point_b);
+        assert_eq!(
+            app.latest_samples
+                .get(&identity_a)
+                .map(|sample| &sample.value),
+            Some(&TelemetryValue::Number(10.0))
+        );
+        assert_eq!(
+            app.latest_samples
+                .get(&identity_b)
+                .map(|sample| &sample.value),
+            Some(&TelemetryValue::Number(20.0))
+        );
+        assert_eq!(app.recent_samples.len(), 2);
+        assert_eq!(app.last_sample_batch, vec![identity_b]);
+    }
+
+    #[test]
+    fn record_samples_caps_recent_history() {
+        let mut app = app_for_tests();
+
+        for index in 0..(RECENT_SAMPLE_CAPACITY + 3) {
+            let point = point(index as u32 + 1);
+            app.record_samples(vec![sample(point, index as f64, index as i64)]);
+        }
+
+        assert_eq!(app.recent_samples.len(), RECENT_SAMPLE_CAPACITY);
+        assert_eq!(
+            app.recent_samples.front().map(|sample| sample.timestamp_ms),
+            Some(3)
+        );
+        assert_eq!(
+            app.recent_samples.back().map(|sample| sample.timestamp_ms),
+            Some((RECENT_SAMPLE_CAPACITY + 2) as i64)
+        );
     }
 }
 
