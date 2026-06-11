@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.93"
 description = "Native BACnet/IP discovery and MQTT republishing utility for NETIX"
+license = "Apache-2.0"
+repository = "https://github.com/NETIX-AI-OSS/bacnet-republisher"
+readme = "README.md"
+keywords = ["bacnet", "mqtt", "building-automation"]
+categories = ["network-programming"]
 default-run = "bacnet-republisher"
 
 [dependencies]

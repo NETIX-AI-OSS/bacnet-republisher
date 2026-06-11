@@ -42,6 +42,10 @@ Tag a release as `v*` to build, sign, verify, zip, and publish the Windows execu
 
 Release assets are the platform zip files (`bacnet-republisher-<tag>-windows-x86_64.zip` and `...-linux-x86_64.zip`), not GitHub's auto-generated "Source code" archives. Extract the zip and run `bacnet-republisher.exe` (Windows) or `bacnet-republisher` (Linux). Windows builds statically link the MSVC runtime, so the Visual C++ Redistributable is not required.
 
+## Configuration
+
+Copy [config.example.toml](config.example.toml) to `config.toml` next to the executable and edit it there, or configure everything from Settings in the app. The local `config.toml` is gitignored.
+
 ## Development
 
 ```bash
@@ -51,3 +55,13 @@ cargo test --locked
 cargo build --locked --release
 cargo run
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
+`vendor/bacnet-transport` contains a patched copy of the `bacnet-transport` crate from the [rusty-bacnet](https://github.com/jscott3201/rusty-bacnet) project, licensed under the [MIT License](vendor/bacnet-transport/LICENSE). See [NOTICE](NOTICE) for details.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project by you shall be licensed under the Apache License 2.0, without any additional terms or conditions.

@@ -1,0 +1,38 @@
+# BACnet Republisher configuration example.
+# Copy to `config.toml` next to the executable, then edit here or via
+# Settings in the app.
+
+version = 2
+
+[bacnet]
+# selected_interface = "192.168.1.10"
+discover_all_interfaces = true
+port = 0
+broadcast_address = "255.255.255.255"
+discovery_window_ms = 3000
+apdu_timeout_ms = 2000
+discovery_bind_failure_policy = "skip"
+
+[mqtt]
+host = "localhost"
+port = 8883
+use_tls = true
+client_id = "netix-bacnet-republisher"
+topic_prefix = "Netix/Site"
+health_topic = "Netix/Site/_health/bacnet-republisher"
+remember_secrets = false
+retain = false
+keep_alive_secs = 30
+
+[[points]]
+enabled = false
+device_instance = 10700
+device_label = "AHU-L-001"
+object_type = "analog_input"
+object_instance = 1
+property = "present_value"
+tag_path = "AHU-L-001/SupplyAirTemp"
+poll_interval_secs = 10
+
+[ui]
+theme = "auto"
