@@ -39,7 +39,6 @@ pub struct BacnetRepublisher {
     devices: Vec<DiscoveredDevice>,
     scanned_objects: Vec<DeviceObject>,
     scan_progress: Option<(usize, usize)>,
-    latest_samples: HashMap<PointIdentity, PointSample>,
     recent_samples: VecDeque<PointSample>,
     last_sample_batch: Vec<PointIdentity>,
     point_statuses: HashMap<PointIdentity, PointStatus>,
@@ -329,7 +328,6 @@ impl BacnetRepublisher {
                 devices: Vec::new(),
                 scanned_objects: Vec::new(),
                 scan_progress: None,
-                latest_samples: HashMap::new(),
                 recent_samples: VecDeque::new(),
                 last_sample_batch: Vec::new(),
                 point_statuses: HashMap::new(),
@@ -1928,7 +1926,6 @@ impl BacnetRepublisher {
                 .entry(identity.clone())
                 .or_default()
                 .record_sample(&sample);
-            self.latest_samples.insert(identity.clone(), sample.clone());
             self.recent_samples.push_back(sample);
             self.last_sample_batch.push(identity);
         }
@@ -1990,7 +1987,7 @@ impl BacnetRepublisher {
             .any(|status| status.stale || status.last_publish_error.is_some())
         {
             ChipKind::Warning
-        } else if self.latest_samples.is_empty() {
+        } else if self.recent_samples.is_empty() {
             ChipKind::Neutral
         } else {
             ChipKind::Success
@@ -2228,7 +2225,6 @@ mod sample_state_tests {
             devices: Vec::new(),
             scanned_objects: Vec::new(),
             scan_progress: None,
-            latest_samples: HashMap::new(),
             recent_samples: VecDeque::new(),
             last_sample_batch: Vec::new(),
             point_statuses: HashMap::new(),
@@ -2276,15 +2272,15 @@ mod sample_state_tests {
         let identity_a = PointIdentity::from_point(&point_a);
         let identity_b = PointIdentity::from_point(&point_b);
         assert_eq!(
-            app.latest_samples
+            app.point_statuses
                 .get(&identity_a)
-                .map(|sample| &sample.value),
+                .and_then(|status| status.last_value.as_ref()),
             Some(&TelemetryValue::Number(10.0))
         );
         assert_eq!(
-            app.latest_samples
+            app.point_statuses
                 .get(&identity_b)
-                .map(|sample| &sample.value),
+                .and_then(|status| status.last_value.as_ref()),
             Some(&TelemetryValue::Number(20.0))
         );
         assert_eq!(app.recent_samples.len(), 2);

@@ -625,7 +625,7 @@ where
             sender
                 .send(WorkerEvent::Log(
                     LogLevel::Error,
-                    format!("Failed to start async runtime: {error}"),
+                    format!("Failed to start async runtime: {error:#}"),
                 ))
                 .ok();
             false
