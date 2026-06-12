@@ -21,6 +21,7 @@ bytes = "1.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 crossbeam-channel = "0.5"
 directories = "6.0"
+futures-util = { version = "0.3", default-features = false }
 get_if_addrs = "0.5"
 iced = { version = "0.14", features = ["fira-sans", "image", "tokio", "svg"] }
 rumqttc = "0.25.1"
@@ -40,6 +41,11 @@ tempfile = "3.23"
 
 [build-dependencies]
 winresource = "0.1"
+
+# swash is pinned to 0.2.7 in Cargo.lock: 0.2.8 has a glyph-hinting cache
+# regression that garbles all text rendering (wrong-size glyphs, broken
+# spacing). See https://github.com/dfrg/swash/issues/120. Do not let
+# `cargo update` move swash past 0.2.7 until that issue is fixed upstream.
 
 # Vendored with a fix: broadcast destination port stays 47808 when the local
 # bind port is ephemeral (port = 0). Upstream sends broadcasts to the local

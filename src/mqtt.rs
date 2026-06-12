@@ -1,25 +1,23 @@
 use crate::config::MqttConfig;
 use crate::model::{PointSample, PublishStats};
 use anyhow::{anyhow, Context, Result};
-use rumqttc::{AsyncClient, EventLoop, MqttOptions, QoS, TlsConfiguration, Transport};
+use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, TlsConfiguration, Transport};
 use serde_json::json;
 use std::fs;
 use std::future::Future;
 use std::io::BufReader;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::time::{sleep, timeout};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::time::sleep;
 
-const DRAIN_SLICE: Duration = Duration::from_millis(250);
-const PUBLISH_DRAIN: Duration = Duration::from_secs(5);
-const INTERLEAVE_DRAIN: Duration = Duration::from_millis(150);
-const INTERLEAVE_EVERY: usize = 16;
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
-// rumqttc's outbound channel must hold the entire burst — publish() blocks if it fills.
-// Sized for full-fleet bursts (~1500 points) with comfortable headroom.
+// Bounds how many QoS 1 publishes can sit waiting for the event loop. While the broker
+// is unreachable the channel fills and try_publish() fails fast — samples are dropped
+// and counted, never blocking the poll loop. Sized for full-fleet bursts (~1500 points).
 const OUTBOUND_CHANNEL_CAPACITY: usize = 4096;
 
 pub trait MqttPublisher {
@@ -78,13 +76,21 @@ impl HealthSnapshot {
     }
 }
 
+#[derive(Default)]
+struct ConnectionState {
+    connected: AtomicBool,
+    reconnects: AtomicUsize,
+    last_error: Mutex<Option<String>>,
+}
+
 pub struct RumqttPublisher {
     client: AsyncClient,
-    eventloop: EventLoop,
-    backoff: ReconnectBackoff,
+    state: Arc<ConnectionState>,
+    eventloop_task: tokio::task::JoinHandle<()>,
 }
 
 impl RumqttPublisher {
+    /// Must be called from within a tokio runtime: the event loop runs in a spawned task.
     pub fn new(config: &MqttConfig) -> Result<Self> {
         let mut options = MqttOptions::new(&config.client_id, &config.host, config.port);
         options.set_keep_alive(Duration::from_secs(config.keep_alive_secs.max(5)));
@@ -92,45 +98,55 @@ impl RumqttPublisher {
         if let Some(username) = config.username.as_deref().filter(|value| !value.is_empty()) {
             options.set_credentials(username, config.password.clone().unwrap_or_default());
         }
-        let (client, eventloop) = AsyncClient::new(options, OUTBOUND_CHANNEL_CAPACITY);
+        let (client, mut eventloop) = AsyncClient::new(options, OUTBOUND_CHANNEL_CAPACITY);
+        let state = Arc::new(ConnectionState::default());
+
+        // The event loop runs in its own task so the request channel always drains.
+        // Driving it from the publishing task deadlocks: once the channel fills,
+        // publish().await blocks waiting for space that only the (then never-polled)
+        // event loop could free.
+        let eventloop_task = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                let mut backoff = ReconnectBackoff::default();
+                loop {
+                    match eventloop.poll().await {
+                        Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                            state.connected.store(true, Ordering::Relaxed);
+                            backoff.reset();
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            if state.connected.swap(false, Ordering::Relaxed) {
+                                state.reconnects.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if let Ok(mut last_error) = state.last_error.lock() {
+                                *last_error = Some(error.to_string());
+                            }
+                            sleep(backoff.next_delay()).await;
+                        }
+                    }
+                }
+            }
+        });
+
         Ok(Self {
             client,
-            eventloop,
-            backoff: ReconnectBackoff::default(),
+            state,
+            eventloop_task,
         })
     }
 
-    pub async fn drain_for(&mut self, duration: Duration) -> Result<PublishStats> {
-        let mut stats = PublishStats::empty();
-        let deadline = Instant::now() + duration;
-
-        while Instant::now() < deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let poll_for = remaining.min(DRAIN_SLICE);
-            match timeout(poll_for, self.eventloop.poll()).await {
-                Ok(Ok(_event)) => self.backoff.reset(),
-                Ok(Err(error)) => {
-                    stats.reconnects += 1;
-                    let error = error.to_string();
-                    stats.last_error = Some(error.clone());
-                    let delay = self.backoff.next_delay();
-                    sleep(delay.min(remaining)).await;
-                    return Err(anyhow!("MQTT event loop failed: {error}"));
-                }
-                Err(_) => break,
-            }
-        }
-
-        Ok(stats)
+    /// Hand a publish to the event loop without blocking. Fails fast when the
+    /// outbound channel is full (broker down long enough to back up the queue).
+    fn enqueue(&self, topic: &str, payload: Vec<u8>, retain: bool) -> Result<()> {
+        self.client
+            .try_publish(topic, QoS::AtLeastOnce, retain, payload)
+            .map_err(|error| anyhow!("failed to enqueue MQTT publish to {topic}: {error}"))
     }
 
-    pub async fn publish_samples_confirmed(
-        &mut self,
-        config: &MqttConfig,
-        samples: &[PointSample],
-    ) -> PublishStats {
+    pub fn enqueue_samples(&mut self, config: &MqttConfig, samples: &[PointSample]) -> PublishStats {
         let mut stats = PublishStats::empty();
-        let mut since_drain = 0usize;
         for sample in samples {
             stats.queued += 1;
             let payload = match serde_json::to_vec(&sample.value.as_json_value()) {
@@ -140,48 +156,26 @@ impl RumqttPublisher {
                     continue;
                 }
             };
-
-            if let Err(error) = self
-                .client
-                .publish(&sample.topic, QoS::AtLeastOnce, config.retain, payload)
-                .await
-            {
-                stats.record_failure(error.to_string());
-            }
-
-            // Interleave a short eventloop drain every N publishes so the outbound
-            // channel never sits full. Without this, large bursts (1000+ samples) can
-            // saturate the channel before the eventloop processes anything, and the
-            // next publish().await blocks indefinitely.
-            since_drain += 1;
-            if since_drain >= INTERLEAVE_EVERY {
-                since_drain = 0;
-                if let Ok(drain_stats) = self.drain_for(INTERLEAVE_DRAIN).await {
-                    stats.reconnects += drain_stats.reconnects;
-                    if drain_stats.last_error.is_some() {
-                        stats.last_error = drain_stats.last_error;
-                    }
-                }
+            match self.enqueue(&sample.topic, payload, config.retain) {
+                Ok(()) => stats.published += 1,
+                Err(error) => stats.record_failure(error.to_string()),
             }
         }
 
-        // Final drain to flush any remaining queued publishes.
-        if stats.failed == 0 {
-            match self.drain_for(PUBLISH_DRAIN).await {
-                Ok(drain_stats) => {
-                    stats.reconnects += drain_stats.reconnects;
-                    if drain_stats.last_error.is_some() {
-                        stats.last_error = drain_stats.last_error;
-                    }
-                    stats.published = stats.queued;
-                }
-                Err(error) => {
-                    stats.record_failure(error.to_string());
-                }
+        stats.reconnects = self.state.reconnects.load(Ordering::Relaxed);
+        if stats.last_error.is_none() {
+            if let Ok(last_error) = self.state.last_error.lock() {
+                stats.last_error = last_error.clone();
             }
         }
-
         stats
+    }
+}
+
+impl Drop for RumqttPublisher {
+    fn drop(&mut self) {
+        self.client.try_disconnect().ok();
+        self.eventloop_task.abort();
     }
 }
 
@@ -192,14 +186,7 @@ impl MqttPublisher for RumqttPublisher {
         payload: Vec<u8>,
         retain: bool,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            self.client
-                .publish(topic, QoS::AtLeastOnce, retain, payload)
-                .await
-                .with_context(|| format!("failed to enqueue MQTT publish to {topic}"))?;
-            self.drain_for(PUBLISH_DRAIN).await?;
-            Ok(())
-        })
+        Box::pin(async move { self.enqueue(topic, payload, retain) })
     }
 }
 

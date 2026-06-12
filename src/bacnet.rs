@@ -16,8 +16,10 @@ use bacnet_services::rpm::ReadAccessSpecification;
 use bacnet_transport::bip::{BipTransport, ForeignDeviceConfig};
 use bacnet_types::enums::{ObjectType, PropertyIdentifier};
 use bacnet_types::primitives::ObjectIdentifier;
+use futures_util::stream::{self, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub type BacnetIpClient = BACnetClient<BipTransport>;
@@ -243,7 +245,9 @@ pub async fn poll_points_once(
         .into_iter()
         .partition(|point| !unresolved_set.contains(&point.device_instance));
 
-    let mut outcome = poll_points_once_with_client(&client, mqtt, &pollable).await?;
+    let mut outcome =
+        poll_points_once_with_client(&client, mqtt, &pollable, bacnet.poll_concurrency, None)
+            .await?;
     for point in skipped {
         let device_instance = point.device_instance;
         outcome.failures.push(PointFailure {
@@ -279,10 +283,16 @@ fn format_unresolved_warning(unresolved: &[u32]) -> String {
     }
 }
 
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
 pub async fn poll_points_once_with_client(
     client: &BacnetIpClient,
     mqtt: &MqttConfig,
     points: &[PointConfig],
+    concurrency: usize,
+    cancel: Option<&AtomicBool>,
 ) -> Result<PollOutcome> {
     let mut by_device = HashMap::<u32, Vec<PollRequest>>::new();
     let mut failures = Vec::new();
@@ -299,24 +309,46 @@ pub async fn poll_points_once_with_client(
         }
     }
 
-    let mut samples = Vec::new();
-    let mut warnings = Vec::new();
-    for (device_instance, requests) in by_device {
-        match read_device_group_rpm(client, mqtt, device_instance, &requests).await {
-            Ok(mut group_samples) => samples.append(&mut group_samples),
-            Err(error) => {
-                warnings.push(format!(
-                    "RPM failed for device {device_instance}; used fallback: {error:#}"
-                ));
-                let fallback = read_device_group_individual(client, mqtt, &requests).await;
-                for result in fallback {
-                    match result {
-                        Ok(sample) => samples.push(sample),
-                        Err(failure) => failures.push(failure),
+    // Device groups are read concurrently (the client's TSM correlates responses
+    // by (mac, invoke_id)), so one dead device's APDU timeouts don't stall the
+    // other devices' schedules.
+    let group_results = stream::iter(by_device)
+        .map(|(device_instance, requests)| async move {
+            if is_cancelled(cancel) {
+                return (None, Vec::new(), Vec::new());
+            }
+            match read_device_group_rpm(client, mqtt, device_instance, &requests).await {
+                Ok(group_samples) => (None, group_samples, Vec::new()),
+                Err(error) => {
+                    let warning = format!(
+                        "RPM failed for device {device_instance}; used fallback: {error:#}"
+                    );
+                    let mut group_samples = Vec::new();
+                    let mut group_failures = Vec::new();
+                    for result in
+                        read_device_group_individual(client, mqtt, &requests, cancel).await
+                    {
+                        match result {
+                            Ok(sample) => group_samples.push(sample),
+                            Err(failure) => group_failures.push(failure),
+                        }
                     }
+                    (Some(warning), group_samples, group_failures)
                 }
             }
+        })
+        .buffer_unordered(concurrency.max(1))
+        .collect::<Vec<_>>()
+        .await;
+
+    let mut samples = Vec::new();
+    let mut warnings = Vec::new();
+    for (warning, mut group_samples, mut group_failures) in group_results {
+        if let Some(warning) = warning {
+            warnings.push(warning);
         }
+        samples.append(&mut group_samples);
+        failures.append(&mut group_failures);
     }
 
     Ok(PollOutcome {
@@ -472,9 +504,14 @@ async fn read_device_group_individual(
     client: &BacnetIpClient,
     mqtt: &MqttConfig,
     requests: &[PollRequest],
+    cancel: Option<&AtomicBool>,
 ) -> Vec<Result<PointSample, PointFailure>> {
     let mut results = Vec::with_capacity(requests.len());
     for request in requests {
+        // Each individual read can wait a full APDU timeout; honor stop between reads.
+        if is_cancelled(cancel) {
+            break;
+        }
         let result = client
             .read_property_from_device(
                 request.point.device_instance,
