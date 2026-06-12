@@ -11,6 +11,11 @@ port = 0
 broadcast_address = "255.255.255.255"
 discovery_window_ms = 3000
 apdu_timeout_ms = 2000
+# Devices read in parallel per poll cycle (1-64).
+poll_concurrency = 8
+# Devices whose reads keep failing are retried with exponential backoff,
+# capped at this many seconds.
+device_backoff_max_secs = 300
 discovery_bind_failure_policy = "skip"
 
 [mqtt]

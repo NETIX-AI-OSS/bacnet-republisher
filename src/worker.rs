@@ -346,6 +346,109 @@ pub fn spawn_poll_and_publish(
     });
 }
 
+/// How often the republisher re-broadcasts Who-Is for devices that are not yet
+/// in the I-Am cache (missed at startup, rebooted, or readdressed).
+const DEVICE_RERESOLVE_INTERVAL: Duration = Duration::from_secs(60);
+/// Upper bound on BACnet client shutdown so a hung transport can't wedge the
+/// lifecycle in `Stopping`.
+const CLIENT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// First retry delay for a device whose reads all failed; doubles per failed
+/// attempt up to the configured `device_backoff_max_secs`.
+const DEVICE_BACKOFF_INITIAL: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy)]
+struct DeviceBackoff {
+    delay: Duration,
+    until: Instant,
+}
+
+/// Escalates backoff for devices where every read failed this cycle and clears
+/// it for devices that produced at least one sample. Returns log messages for
+/// the caller to emit.
+fn update_device_backoffs(
+    backoffs: &mut HashMap<u32, DeviceBackoff>,
+    polled_devices: &HashSet<u32>,
+    outcome: &PollOutcome,
+    now: Instant,
+    max_delay: Duration,
+) -> Vec<(LogLevel, String)> {
+    let healthy = outcome
+        .samples
+        .iter()
+        .map(|sample| sample.point.device_instance)
+        .collect::<HashSet<_>>();
+    let failed = outcome
+        .failures
+        .iter()
+        .map(|failure| failure.point.device_instance)
+        .collect::<HashSet<_>>();
+
+    let mut messages = Vec::new();
+    for &device in polled_devices {
+        if healthy.contains(&device) {
+            if backoffs.remove(&device).is_some() {
+                messages.push((
+                    LogLevel::Info,
+                    format!("device {device} responding again; backoff cleared"),
+                ));
+            }
+        } else if failed.contains(&device) {
+            let delay = match backoffs.get(&device) {
+                Some(backoff) => backoff.delay.saturating_mul(2).min(max_delay),
+                None => DEVICE_BACKOFF_INITIAL.min(max_delay),
+            };
+            backoffs.insert(
+                device,
+                DeviceBackoff {
+                    delay,
+                    until: now + delay,
+                },
+            );
+            messages.push((
+                LogLevel::Warning,
+                format!(
+                    "device {device}: all reads failed; next attempt in {}s",
+                    delay.as_secs()
+                ),
+            ));
+        }
+        // Neither sampled nor failed: the cycle was cancelled before this device
+        // was reached — leave its backoff state untouched.
+    }
+    messages
+}
+
+/// Mark every enabled point on an unresolved device as failed, so the UI and the
+/// MQTT health snapshot report them stale instead of silently skipping them.
+fn record_unresolved_failures(
+    sender: &Sender<WorkerEvent>,
+    points: &[PointConfig],
+    unresolved_devices: &HashSet<u32>,
+    point_statuses: &mut HashMap<PointIdentity, PointStatus>,
+) {
+    if unresolved_devices.is_empty() {
+        return;
+    }
+    let failures = points
+        .iter()
+        .filter(|point| point.enabled && unresolved_devices.contains(&point.device_instance))
+        .map(|point| PointFailure {
+            point: point.clone(),
+            error: format!("device {} not in I-Am cache", point.device_instance),
+        })
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        return;
+    }
+    for failure in &failures {
+        point_statuses
+            .entry(PointIdentity::from_point(&failure.point))
+            .or_default()
+            .record_read_failure(failure.error.clone());
+    }
+    sender.send(WorkerEvent::Failures(failures)).ok();
+}
+
 pub fn spawn_republisher(
     sender: Sender<WorkerEvent>,
     bacnet: BacnetConfig,
@@ -357,7 +460,7 @@ pub fn spawn_republisher(
     std::thread::spawn(move || {
         let runtime_sender = sender.clone();
         let future_sender = sender.clone();
-        let runtime_started = run_async(runtime_sender, async move {
+        let completed = run_async(runtime_sender, async move {
             let sender = future_sender;
             sender
                 .send(WorkerEvent::RepublisherLifecycle(
@@ -421,7 +524,8 @@ pub fn spawn_republisher(
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
-            let unresolved_devices: HashSet<u32> = match refresh_device_table(
+            let mut point_statuses = HashMap::<PointIdentity, PointStatus>::new();
+            let mut unresolved_devices: HashSet<u32> = match refresh_device_table(
                 &client,
                 &bacnet,
                 &unique_device_instances,
@@ -434,9 +538,10 @@ pub fn spawn_republisher(
                                 .send(WorkerEvent::Log(
                                     LogLevel::Warning,
                                     format!(
-                                        "{} of {} device(s) not in I-Am cache; their points will be skipped (restart republisher to re-attempt)",
+                                        "{} of {} device(s) not in I-Am cache; their points will be skipped (resolution retried every {}s)",
                                         refresh.unresolved.len(),
-                                        unique_device_instances.len()
+                                        unique_device_instances.len(),
+                                        DEVICE_RERESOLVE_INTERVAL.as_secs()
                                     ),
                                 ))
                                 .ok();
@@ -453,10 +558,50 @@ pub fn spawn_republisher(
                     HashSet::new()
                 }
             };
+            record_unresolved_failures(&sender, &points, &unresolved_devices, &mut point_statuses);
+            let mut last_resolve_attempt = Instant::now();
 
             let mut last_polled = HashMap::<usize, Instant>::new();
-            let mut point_statuses = HashMap::<PointIdentity, PointStatus>::new();
+            let mut device_backoffs = HashMap::<u32, DeviceBackoff>::new();
+            let device_backoff_max = Duration::from_secs(bacnet.device_backoff_max_secs.max(10));
             while !stop.load(Ordering::Relaxed) {
+                // Devices that missed the startup Who-Is window (or rebooted with a new
+                // address) get periodic re-resolution attempts instead of being skipped
+                // until the republisher is restarted.
+                if !unresolved_devices.is_empty()
+                    && last_resolve_attempt.elapsed() >= DEVICE_RERESOLVE_INTERVAL
+                {
+                    last_resolve_attempt = Instant::now();
+                    let targets = unresolved_devices.iter().copied().collect::<Vec<_>>();
+                    match refresh_device_table(&client, &bacnet, &targets).await {
+                        Ok(refresh) => {
+                            if !refresh.resolved.is_empty() {
+                                sender
+                                    .send(WorkerEvent::Log(
+                                        LogLevel::Info,
+                                        format!(
+                                            "{} previously unresolved device(s) now responding: {:?}",
+                                            refresh.resolved.len(),
+                                            refresh.resolved
+                                        ),
+                                    ))
+                                    .ok();
+                                for instance in &refresh.resolved {
+                                    unresolved_devices.remove(instance);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            sender
+                                .send(WorkerEvent::Log(
+                                    LogLevel::Warning,
+                                    format!("Device re-resolution failed: {error:#}"),
+                                ))
+                                .ok();
+                        }
+                    }
+                }
+
                 let now = Instant::now();
                 let due_points = points
                     .iter()
@@ -464,6 +609,9 @@ pub fn spawn_republisher(
                     .filter(|(index, point)| {
                         point.enabled
                             && !unresolved_devices.contains(&point.device_instance)
+                            && device_backoffs
+                                .get(&point.device_instance)
+                                .is_none_or(|backoff| now >= backoff.until)
                             && last_polled
                                 .get(index)
                                 .map(|last| {
@@ -480,7 +628,15 @@ pub fn spawn_republisher(
                         .iter()
                         .map(|(_, point)| point.clone())
                         .collect::<Vec<_>>();
-                    match poll_points_once_with_client(&client, &mqtt, &poll_set).await {
+                    match poll_points_once_with_client(
+                        &client,
+                        &mqtt,
+                        &poll_set,
+                        bacnet.poll_concurrency,
+                        Some(&stop),
+                    )
+                    .await
+                    {
                         Ok(outcome) => {
                             for (index, _) in due_points {
                                 last_polled.insert(index, now);
@@ -496,6 +652,19 @@ pub fn spawn_republisher(
                                     .entry(PointIdentity::from_point(&failure.point))
                                     .or_default()
                                     .record_read_failure(failure.error.clone());
+                            }
+                            let polled_devices = poll_set
+                                .iter()
+                                .map(|point| point.device_instance)
+                                .collect::<HashSet<_>>();
+                            for (level, message) in update_device_backoffs(
+                                &mut device_backoffs,
+                                &polled_devices,
+                                &outcome,
+                                now,
+                                device_backoff_max,
+                            ) {
+                                sender.send(WorkerEvent::Log(level, message)).ok();
                             }
                             let stale_points = point_statuses
                                 .values()
@@ -529,7 +698,20 @@ pub fn spawn_republisher(
                     RepublisherLifecycle::Stopping,
                 ))
                 .ok();
-            client.stop().await.ok();
+            if tokio::time::timeout(CLIENT_STOP_TIMEOUT, client.stop())
+                .await
+                .is_err()
+            {
+                sender
+                    .send(WorkerEvent::Log(
+                        LogLevel::Warning,
+                        format!(
+                            "BACnet client did not stop within {}s; abandoning it",
+                            CLIENT_STOP_TIMEOUT.as_secs()
+                        ),
+                    ))
+                    .ok();
+            }
             sender
                 .send(WorkerEvent::RepublisherLifecycle(
                     RepublisherLifecycle::Stopped,
@@ -541,10 +723,15 @@ pub fn spawn_republisher(
                 ))
                 .ok();
         });
-        if !runtime_started {
+        // Covers both runtime startup failure and a panic anywhere in the worker —
+        // without this the UI would stay in Starting/Running/Stopping forever with
+        // no way to restart.
+        if !completed {
             sender
                 .send(WorkerEvent::RepublisherLifecycle(
-                    RepublisherLifecycle::Failed("Failed to start async runtime".to_string()),
+                    RepublisherLifecycle::Failed(
+                        "Republisher worker stopped unexpectedly; see log for details".to_string(),
+                    ),
                 ))
                 .ok();
         }
@@ -578,9 +765,7 @@ async fn emit_poll_outcome(
             ))
             .ok();
     }
-    let stats = publisher
-        .publish_samples_confirmed(mqtt, &outcome.samples)
-        .await;
+    let stats = publisher.enqueue_samples(mqtt, &outcome.samples);
     let _ = publish_health(
         publisher,
         mqtt,
@@ -609,18 +794,19 @@ async fn emit_poll_outcome(
     )
 }
 
+/// Runs the worker future to completion, returning false if the runtime could not
+/// start or the future panicked. A panicking worker must not die silently: the UI
+/// cannot observe thread death (it holds its own sender clone, so the channel never
+/// disconnects) and would otherwise show a stale state forever.
 fn run_async<F>(sender: Sender<WorkerEvent>, future: F) -> bool
 where
     F: std::future::Future<Output = ()>,
 {
-    match tokio::runtime::Builder::new_multi_thread()
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
     {
-        Ok(runtime) => {
-            runtime.block_on(future);
-            true
-        }
+        Ok(runtime) => runtime,
         Err(error) => {
             sender
                 .send(WorkerEvent::Log(
@@ -628,7 +814,187 @@ where
                     format!("Failed to start async runtime: {error:#}"),
                 ))
                 .ok();
+            return false;
+        }
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(future))) {
+        Ok(()) => true,
+        Err(panic) => {
+            sender
+                .send(WorkerEvent::Log(
+                    LogLevel::Error,
+                    format!("Worker thread crashed: {}", panic_message(panic.as_ref())),
+                ))
+                .ok();
+            sender
+                .send(WorkerEvent::Finished(
+                    "Worker stopped unexpectedly".to_string(),
+                ))
+                .ok();
             false
         }
+    }
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::unbounded;
+
+    fn point_on_device(device_instance: u32, enabled: bool) -> PointConfig {
+        PointConfig {
+            device_instance,
+            enabled,
+            ..PointConfig::default()
+        }
+    }
+
+    #[test]
+    fn unresolved_devices_mark_points_stale_and_emit_failures() {
+        let (sender, receiver) = unbounded();
+        let points = vec![
+            point_on_device(100, true),
+            point_on_device(200, true),
+            point_on_device(100, false),
+        ];
+        let unresolved = HashSet::from([100]);
+        let mut statuses = HashMap::new();
+
+        record_unresolved_failures(&sender, &points, &unresolved, &mut statuses);
+
+        assert_eq!(statuses.len(), 1);
+        let status = statuses.values().next().unwrap();
+        assert!(status.stale);
+        assert!(status.last_error.as_deref().unwrap().contains("100"));
+
+        let event = receiver.try_recv().unwrap();
+        match event {
+            WorkerEvent::Failures(failures) => {
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].point.device_instance, 100);
+            }
+            other => panic!("expected Failures event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fully_resolved_devices_emit_nothing() {
+        let (sender, receiver) = unbounded();
+        let points = vec![point_on_device(100, true)];
+        let mut statuses = HashMap::new();
+
+        record_unresolved_failures(&sender, &points, &HashSet::new(), &mut statuses);
+
+        assert!(statuses.is_empty());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    fn outcome_with(samples_for: &[u32], failures_for: &[u32]) -> PollOutcome {
+        PollOutcome {
+            samples: samples_for
+                .iter()
+                .map(|&device_instance| PointSample {
+                    point: point_on_device(device_instance, true),
+                    topic: "t".to_string(),
+                    value: crate::model::TelemetryValue::Number(1.0),
+                    timestamp_ms: 0,
+                })
+                .collect(),
+            failures: failures_for
+                .iter()
+                .map(|&device_instance| PointFailure {
+                    point: point_on_device(device_instance, true),
+                    error: "timeout".to_string(),
+                })
+                .collect(),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn failing_device_backs_off_exponentially_up_to_cap() {
+        let mut backoffs = HashMap::new();
+        let polled = HashSet::from([100]);
+        let now = Instant::now();
+        let max = Duration::from_secs(30);
+
+        update_device_backoffs(&mut backoffs, &polled, &outcome_with(&[], &[100]), now, max);
+        assert_eq!(backoffs[&100].delay, Duration::from_secs(10));
+        assert_eq!(backoffs[&100].until, now + Duration::from_secs(10));
+
+        update_device_backoffs(&mut backoffs, &polled, &outcome_with(&[], &[100]), now, max);
+        assert_eq!(backoffs[&100].delay, Duration::from_secs(20));
+
+        update_device_backoffs(&mut backoffs, &polled, &outcome_with(&[], &[100]), now, max);
+        assert_eq!(backoffs[&100].delay, Duration::from_secs(30));
+
+        update_device_backoffs(&mut backoffs, &polled, &outcome_with(&[], &[100]), now, max);
+        assert_eq!(backoffs[&100].delay, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn successful_sample_clears_backoff_even_with_partial_failures() {
+        let mut backoffs = HashMap::new();
+        let polled = HashSet::from([100]);
+        let now = Instant::now();
+        let max = Duration::from_secs(300);
+
+        update_device_backoffs(&mut backoffs, &polled, &outcome_with(&[], &[100]), now, max);
+        assert!(backoffs.contains_key(&100));
+
+        // One good sample means the device is alive, even if other points failed.
+        let messages = update_device_backoffs(
+            &mut backoffs,
+            &polled,
+            &outcome_with(&[100], &[100]),
+            now,
+            max,
+        );
+        assert!(backoffs.is_empty());
+        assert!(messages
+            .iter()
+            .any(|(_, message)| message.contains("responding again")));
+    }
+
+    #[test]
+    fn cancelled_cycle_leaves_unreached_devices_untouched() {
+        let mut backoffs = HashMap::new();
+        let polled = HashSet::from([100, 200]);
+        let now = Instant::now();
+        let max = Duration::from_secs(300);
+
+        // Device 200 was in the poll set but produced neither samples nor
+        // failures (cycle cancelled before it was reached).
+        update_device_backoffs(&mut backoffs, &polled, &outcome_with(&[100], &[]), now, max);
+        assert!(!backoffs.contains_key(&200));
+    }
+
+    #[test]
+    fn run_async_reports_panics_instead_of_dying_silently() {
+        let (sender, receiver) = unbounded();
+
+        let completed = run_async(sender, async {
+            panic!("boom");
+        });
+
+        assert!(!completed);
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            WorkerEvent::Log(LogLevel::Error, message) if message.contains("boom")
+        )));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, WorkerEvent::Finished(_))));
     }
 }

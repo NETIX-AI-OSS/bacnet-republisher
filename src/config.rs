@@ -34,6 +34,12 @@ pub struct BacnetConfig {
     pub discovery_window_ms: u64,
     #[serde(default = "default_apdu_timeout_ms")]
     pub apdu_timeout_ms: u64,
+    /// How many devices the republisher reads concurrently per poll cycle.
+    #[serde(default = "default_poll_concurrency")]
+    pub poll_concurrency: usize,
+    /// Cap on the exponential retry delay for devices whose reads keep failing.
+    #[serde(default = "default_device_backoff_max_secs")]
+    pub device_backoff_max_secs: u64,
     #[serde(default = "default_discovery_bind_failure_policy")]
     pub discovery_bind_failure_policy: DiscoveryBindFailurePolicy,
     #[serde(default)]
@@ -173,6 +179,12 @@ impl AppConfig {
         if self.bacnet.apdu_timeout_ms < 250 {
             return Err("BACnet APDU timeout must be at least 250 ms".to_string());
         }
+        if self.bacnet.poll_concurrency == 0 || self.bacnet.poll_concurrency > 64 {
+            return Err("BACnet poll concurrency must be between 1 and 64".to_string());
+        }
+        if self.bacnet.device_backoff_max_secs < 10 {
+            return Err("Device backoff cap must be at least 10 seconds".to_string());
+        }
         if self.mqtt.host.trim().is_empty() {
             return Err("MQTT host cannot be empty".to_string());
         }
@@ -241,6 +253,8 @@ impl Default for BacnetConfig {
             broadcast_address: default_broadcast_address(),
             discovery_window_ms: default_discovery_window_ms(),
             apdu_timeout_ms: default_apdu_timeout_ms(),
+            poll_concurrency: default_poll_concurrency(),
+            device_backoff_max_secs: default_device_backoff_max_secs(),
             discovery_bind_failure_policy: default_discovery_bind_failure_policy(),
             bbmd: None,
         }
@@ -349,6 +363,14 @@ fn default_discovery_window_ms() -> u64 {
 
 fn default_apdu_timeout_ms() -> u64 {
     2_000
+}
+
+fn default_poll_concurrency() -> usize {
+    8
+}
+
+fn default_device_backoff_max_secs() -> u64 {
+    300
 }
 
 fn default_discovery_bind_failure_policy() -> DiscoveryBindFailurePolicy {

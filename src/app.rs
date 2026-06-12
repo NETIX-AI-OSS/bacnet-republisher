@@ -76,6 +76,8 @@ pub enum Message {
     BroadcastAddressChanged(String),
     DiscoveryWindowChanged(String),
     ApduTimeoutChanged(String),
+    PollConcurrencyChanged(String),
+    DeviceBackoffMaxChanged(String),
     DiscoveryBindFailurePolicySelected(DiscoveryBindFailurePolicy),
     BbmdEnabledChanged(bool),
     BbmdAddressChanged(String),
@@ -140,6 +142,8 @@ struct SettingsDraft {
     broadcast_address: String,
     discovery_window_ms: String,
     apdu_timeout_ms: String,
+    poll_concurrency: String,
+    device_backoff_max_secs: String,
     discovery_bind_failure_policy: DiscoveryBindFailurePolicy,
     bbmd_enabled: bool,
     bbmd_address: String,
@@ -170,6 +174,8 @@ impl SettingsDraft {
             broadcast_address: config.bacnet.broadcast_address.to_string(),
             discovery_window_ms: config.bacnet.discovery_window_ms.to_string(),
             apdu_timeout_ms: config.bacnet.apdu_timeout_ms.to_string(),
+            poll_concurrency: config.bacnet.poll_concurrency.to_string(),
+            device_backoff_max_secs: config.bacnet.device_backoff_max_secs.to_string(),
             discovery_bind_failure_policy: config.bacnet.discovery_bind_failure_policy,
             bbmd_enabled: bbmd.is_some(),
             bbmd_address: bbmd
@@ -212,6 +218,11 @@ impl SettingsDraft {
         config.bacnet.discovery_window_ms =
             parse_u64(&self.discovery_window_ms, "discovery window")?;
         config.bacnet.apdu_timeout_ms = parse_u64(&self.apdu_timeout_ms, "APDU timeout")?;
+        config.bacnet.poll_concurrency =
+            usize::try_from(parse_u64(&self.poll_concurrency, "poll concurrency")?)
+                .map_err(|_| "Poll concurrency is too large".to_string())?;
+        config.bacnet.device_backoff_max_secs =
+            parse_u64(&self.device_backoff_max_secs, "device backoff cap")?;
         config.bacnet.discovery_bind_failure_policy = self.discovery_bind_failure_policy;
         config.bacnet.bbmd = if self.bbmd_enabled {
             Some(BbmdConfig {
@@ -396,6 +407,10 @@ impl BacnetRepublisher {
             Message::BroadcastAddressChanged(value) => self.settings.broadcast_address = value,
             Message::DiscoveryWindowChanged(value) => self.settings.discovery_window_ms = value,
             Message::ApduTimeoutChanged(value) => self.settings.apdu_timeout_ms = value,
+            Message::PollConcurrencyChanged(value) => self.settings.poll_concurrency = value,
+            Message::DeviceBackoffMaxChanged(value) => {
+                self.settings.device_backoff_max_secs = value
+            }
             Message::DiscoveryBindFailurePolicySelected(value) => {
                 self.settings.discovery_bind_failure_policy = value;
             }
@@ -1322,6 +1337,23 @@ impl BacnetRepublisher {
                         "Minimum 250 ms",
                         &self.settings.apdu_timeout_ms,
                         Message::ApduTimeoutChanged
+                    ),
+                ]
+                .spacing(12),
+                row![
+                    ui::labeled_input(
+                        palette,
+                        "Poll concurrency",
+                        "Devices read in parallel (1-64)",
+                        &self.settings.poll_concurrency,
+                        Message::PollConcurrencyChanged
+                    ),
+                    ui::labeled_input(
+                        palette,
+                        "Device backoff cap s",
+                        "Max retry delay for failing devices",
+                        &self.settings.device_backoff_max_secs,
+                        Message::DeviceBackoffMaxChanged
                     ),
                 ]
                 .spacing(12),
