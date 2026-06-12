@@ -1,7 +1,7 @@
 use crate::bacnet::{
     build_client, discover_devices, point_from_object, poll_points_once,
     poll_points_once_with_client, read_device_label, refresh_device_table, scan_device_objects,
-    scan_device_objects_with_client,
+    scan_device_objects_with_client, RefreshOutcome,
 };
 use crate::config::{BacnetConfig, MqttConfig};
 use crate::import::merge_imported_points;
@@ -134,13 +134,14 @@ pub fn spawn_scan_all_objects(
                 }
             };
 
+            let mut unresolved_scans = 0usize;
             match refresh_device_table(&client, &config, &device_instances).await {
                 Ok(refresh) if !refresh.unresolved.is_empty() => {
                     sender
                         .send(WorkerEvent::Log(
                             LogLevel::Warning,
                             format!(
-                                "{} of {} device(s) not in I-Am cache after broadcast; their scans will fail",
+                                "{} of {} device(s) not in I-Am cache after refresh; retrying before each affected scan",
                                 refresh.unresolved.len(),
                                 device_instances.len()
                             ),
@@ -162,6 +163,57 @@ pub fn spawn_scan_all_objects(
             let mut imported_points = Vec::new();
             let mut failures = 0usize;
             for (idx, &device_instance) in device_instances.iter().enumerate() {
+                if client.get_device(device_instance).await.is_none() {
+                    match refresh_device_table(&client, &config, &[device_instance]).await {
+                        Ok(refresh) if refresh.unresolved.contains(&device_instance) => {
+                            unresolved_scans += 1;
+                            failures += 1;
+                            sender
+                                .send(WorkerEvent::Log(
+                                    LogLevel::Warning,
+                                    format!(
+                                        "device {device_instance}: unresolved after focused refresh; scan skipped"
+                                    ),
+                                ))
+                                .ok();
+                            sender
+                                .send(WorkerEvent::ScanProgress {
+                                    current: idx + 1,
+                                    total,
+                                })
+                                .ok();
+                            continue;
+                        }
+                        Ok(_) => {
+                            sender
+                                .send(WorkerEvent::Log(
+                                    LogLevel::Info,
+                                    format!(
+                                        "device {device_instance}: resolved after focused refresh"
+                                    ),
+                                ))
+                                .ok();
+                        }
+                        Err(error) => {
+                            failures += 1;
+                            sender
+                                .send(WorkerEvent::Log(
+                                    LogLevel::Warning,
+                                    format!(
+                                        "device {device_instance}: focused refresh failed: {error:#}"
+                                    ),
+                                ))
+                                .ok();
+                            sender
+                                .send(WorkerEvent::ScanProgress {
+                                    current: idx + 1,
+                                    total,
+                                })
+                                .ok();
+                            continue;
+                        }
+                    }
+                }
                 let device_label = read_device_label(&client, device_instance).await;
                 match scan_device_objects_with_client(
                     &client,
@@ -225,7 +277,7 @@ pub fn spawn_scan_all_objects(
                 .ok();
             sender
                 .send(WorkerEvent::Finished(format!(
-                    "Scanned {scanned} object(s) across {total} device(s) ({failures} failure(s)) — {added} point(s) added, {updated} updated, {total_points} total"
+                    "Scanned {scanned} object(s) across {total} device(s) ({failures} failure(s), {unresolved_scans} unresolved) — {added} point(s) added, {updated} updated, {total_points} total"
                 )))
                 .ok();
         });
@@ -349,6 +401,8 @@ pub fn spawn_poll_and_publish(
 /// How often the republisher re-broadcasts Who-Is for devices that are not yet
 /// in the I-Am cache (missed at startup, rebooted, or readdressed).
 const DEVICE_RERESOLVE_INTERVAL: Duration = Duration::from_secs(60);
+/// Refresh all known device addresses before bacnet-client's 600s device table TTL.
+const DEVICE_TABLE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(240);
 /// Upper bound on BACnet client shutdown so a hung transport can't wedge the
 /// lifecycle in `Stopping`.
 const CLIENT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -360,6 +414,12 @@ const DEVICE_BACKOFF_INITIAL: Duration = Duration::from_secs(10);
 struct DeviceBackoff {
     delay: Duration,
     until: Instant,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RefreshStateChange {
+    newly_resolved: Vec<u32>,
+    newly_unresolved: HashSet<u32>,
 }
 
 /// Escalates backoff for devices where every read failed this cycle and clears
@@ -416,6 +476,68 @@ fn update_device_backoffs(
         // was reached — leave its backoff state untouched.
     }
     messages
+}
+
+fn apply_refresh_state(
+    unresolved_devices: &mut HashSet<u32>,
+    device_backoffs: &mut HashMap<u32, DeviceBackoff>,
+    refresh: &RefreshOutcome,
+) -> RefreshStateChange {
+    let mut change = RefreshStateChange::default();
+
+    for &device in &refresh.resolved {
+        if unresolved_devices.remove(&device) {
+            change.newly_resolved.push(device);
+        }
+        device_backoffs.remove(&device);
+    }
+    change.newly_resolved.sort_unstable();
+    change.newly_resolved.dedup();
+
+    for &device in &refresh.unresolved {
+        if unresolved_devices.insert(device) {
+            change.newly_unresolved.insert(device);
+        }
+    }
+
+    change
+}
+
+fn emit_refresh_state_change(
+    sender: &Sender<WorkerEvent>,
+    points: &[PointConfig],
+    label: &str,
+    change: RefreshStateChange,
+    point_statuses: &mut HashMap<PointIdentity, PointStatus>,
+) {
+    if !change.newly_resolved.is_empty() {
+        sender
+            .send(WorkerEvent::Log(
+                LogLevel::Info,
+                format!(
+                    "{} device(s) resolved during {label}: {:?}",
+                    change.newly_resolved.len(),
+                    change.newly_resolved
+                ),
+            ))
+            .ok();
+    }
+    if !change.newly_unresolved.is_empty() {
+        let mut newly_unresolved = change.newly_unresolved.into_iter().collect::<Vec<_>>();
+        newly_unresolved.sort_unstable();
+        sender
+            .send(WorkerEvent::Log(
+                LogLevel::Warning,
+                format!(
+                    "{} device(s) unresolved during {label}: {:?}",
+                    newly_unresolved.len(),
+                    newly_unresolved
+                ),
+            ))
+            .ok();
+        let newly_unresolved_set = newly_unresolved.iter().copied().collect::<HashSet<_>>();
+        record_unresolved_failures(sender, points, &newly_unresolved_set, point_statuses);
+    }
 }
 
 /// Mark every enabled point on an unresolved device as failed, so the UI and the
@@ -517,13 +639,13 @@ pub fn spawn_republisher(
                     RepublisherLifecycle::Running,
                 ))
                 .ok();
-            let unique_device_instances = points
+            let mut unique_device_instances = points
                 .iter()
                 .filter(|p| p.enabled)
                 .map(|p| p.device_instance)
-                .collect::<HashSet<_>>()
-                .into_iter()
                 .collect::<Vec<_>>();
+            unique_device_instances.sort_unstable();
+            unique_device_instances.dedup();
             let mut point_statuses = HashMap::<PointIdentity, PointStatus>::new();
             let mut unresolved_devices: HashSet<u32> = match refresh_device_table(
                 &client,
@@ -560,36 +682,66 @@ pub fn spawn_republisher(
             };
             record_unresolved_failures(&sender, &points, &unresolved_devices, &mut point_statuses);
             let mut last_resolve_attempt = Instant::now();
+            let mut last_full_refresh = Instant::now();
 
             let mut last_polled = HashMap::<usize, Instant>::new();
             let mut device_backoffs = HashMap::<u32, DeviceBackoff>::new();
             let device_backoff_max = Duration::from_secs(bacnet.device_backoff_max_secs.max(10));
             while !stop.load(Ordering::Relaxed) {
+                let mut refreshed_this_iteration = false;
+                if last_full_refresh.elapsed() >= DEVICE_TABLE_KEEPALIVE_INTERVAL {
+                    last_full_refresh = Instant::now();
+                    last_resolve_attempt = Instant::now();
+                    refreshed_this_iteration = true;
+                    match refresh_device_table(&client, &bacnet, &unique_device_instances).await {
+                        Ok(refresh) => {
+                            let change = apply_refresh_state(
+                                &mut unresolved_devices,
+                                &mut device_backoffs,
+                                &refresh,
+                            );
+                            emit_refresh_state_change(
+                                &sender,
+                                &points,
+                                "device table keepalive",
+                                change,
+                                &mut point_statuses,
+                            );
+                        }
+                        Err(error) => {
+                            sender
+                                .send(WorkerEvent::Log(
+                                    LogLevel::Warning,
+                                    format!("Device table keepalive failed: {error:#}"),
+                                ))
+                                .ok();
+                        }
+                    }
+                }
+
                 // Devices that missed the startup Who-Is window (or rebooted with a new
                 // address) get periodic re-resolution attempts instead of being skipped
                 // until the republisher is restarted.
-                if !unresolved_devices.is_empty()
+                if !refreshed_this_iteration
+                    && !unresolved_devices.is_empty()
                     && last_resolve_attempt.elapsed() >= DEVICE_RERESOLVE_INTERVAL
                 {
                     last_resolve_attempt = Instant::now();
                     let targets = unresolved_devices.iter().copied().collect::<Vec<_>>();
                     match refresh_device_table(&client, &bacnet, &targets).await {
                         Ok(refresh) => {
-                            if !refresh.resolved.is_empty() {
-                                sender
-                                    .send(WorkerEvent::Log(
-                                        LogLevel::Info,
-                                        format!(
-                                            "{} previously unresolved device(s) now responding: {:?}",
-                                            refresh.resolved.len(),
-                                            refresh.resolved
-                                        ),
-                                    ))
-                                    .ok();
-                                for instance in &refresh.resolved {
-                                    unresolved_devices.remove(instance);
-                                }
-                            }
+                            let change = apply_refresh_state(
+                                &mut unresolved_devices,
+                                &mut device_backoffs,
+                                &refresh,
+                            );
+                            emit_refresh_state_change(
+                                &sender,
+                                &points,
+                                "device re-resolution",
+                                change,
+                                &mut point_statuses,
+                            );
                         }
                         Err(error) => {
                             sender
@@ -897,6 +1049,40 @@ mod tests {
 
         assert!(statuses.is_empty());
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn refresh_state_adds_and_removes_unresolved_devices_and_clears_backoff() {
+        let mut unresolved = HashSet::from([100, 200]);
+        let now = Instant::now();
+        let mut backoffs = HashMap::from([
+            (
+                100,
+                DeviceBackoff {
+                    delay: Duration::from_secs(10),
+                    until: now,
+                },
+            ),
+            (
+                300,
+                DeviceBackoff {
+                    delay: Duration::from_secs(10),
+                    until: now,
+                },
+            ),
+        ]);
+        let refresh = RefreshOutcome {
+            resolved: vec![100, 300],
+            unresolved: vec![200, 400],
+        };
+
+        let change = apply_refresh_state(&mut unresolved, &mut backoffs, &refresh);
+
+        assert_eq!(change.newly_resolved, vec![100]);
+        assert_eq!(change.newly_unresolved, HashSet::from([400]));
+        assert_eq!(unresolved, HashSet::from([200, 400]));
+        assert!(!backoffs.contains_key(&100));
+        assert!(!backoffs.contains_key(&300));
     }
 
     fn outcome_with(samples_for: &[u32], failures_for: &[u32]) -> PollOutcome {

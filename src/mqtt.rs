@@ -83,6 +83,24 @@ struct ConnectionState {
     last_error: Mutex<Option<String>>,
 }
 
+impl ConnectionState {
+    fn record_connack(&self) {
+        self.connected.store(true, Ordering::Relaxed);
+        if let Ok(mut last_error) = self.last_error.lock() {
+            *last_error = None;
+        }
+    }
+
+    fn record_error(&self, error: impl Into<String>) {
+        if self.connected.swap(false, Ordering::Relaxed) {
+            self.reconnects.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Ok(mut last_error) = self.last_error.lock() {
+            *last_error = Some(error.into());
+        }
+    }
+}
+
 pub struct RumqttPublisher {
     client: AsyncClient,
     state: Arc<ConnectionState>,
@@ -115,17 +133,12 @@ impl RumqttPublisher {
                 loop {
                     match eventloop.poll().await {
                         Ok(Event::Incoming(Packet::ConnAck(_))) => {
-                            state.connected.store(true, Ordering::Relaxed);
+                            state.record_connack();
                             backoff.reset();
                         }
                         Ok(_) => {}
                         Err(error) => {
-                            if state.connected.swap(false, Ordering::Relaxed) {
-                                state.reconnects.fetch_add(1, Ordering::Relaxed);
-                            }
-                            if let Ok(mut last_error) = state.last_error.lock() {
-                                *last_error = Some(error.to_string());
-                            }
+                            state.record_error(error.to_string());
                             sleep(backoff.next_delay()).await;
                         }
                     }
@@ -431,6 +444,25 @@ mod tests {
 
         backoff.reset();
         assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn connack_clears_previous_connection_error() {
+        let state = ConnectionState::default();
+        state.connected.store(true, Ordering::Relaxed);
+
+        state.record_error("network closed");
+        assert_eq!(state.reconnects.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            state.last_error.lock().unwrap().as_deref(),
+            Some("network closed")
+        );
+
+        state.record_connack();
+
+        assert!(state.connected.load(Ordering::Relaxed));
+        assert_eq!(state.reconnects.load(Ordering::Relaxed), 1);
+        assert_eq!(*state.last_error.lock().unwrap(), None);
     }
 
     #[tokio::test]

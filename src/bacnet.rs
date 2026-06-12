@@ -24,6 +24,11 @@ use std::time::Duration;
 
 pub type BacnetIpClient = BACnetClient<BipTransport>;
 
+const DISCOVERY_BROADCAST_PASSES: usize = 3;
+const REFRESH_TARGETED_PASSES: usize = 2;
+const REFRESH_TARGETED_CHUNK_SIZE: usize = 25;
+const REFRESH_TARGETED_WAIT: Duration = Duration::from_millis(1_000);
+
 pub async fn discover_devices(
     config: &BacnetConfig,
     interfaces: &[NetworkInterface],
@@ -47,21 +52,28 @@ pub async fn discover_devices(
         };
         bound_any = true;
 
-        if let Err(error) = client.who_is(None, None).await {
-            let message = format!("Who-Is failed on {interface}: {error}");
-            if strict {
-                client.stop().await.ok();
-                return Err(anyhow!(message));
+        let mut any_pass_sent = false;
+        for pass in 0..DISCOVERY_BROADCAST_PASSES {
+            if let Err(error) = client.who_is(None, None).await {
+                let message = format!("Who-Is pass {} failed on {interface}: {error}", pass + 1);
+                if strict {
+                    client.stop().await.ok();
+                    return Err(anyhow!(message));
+                }
+                warnings.push(message);
+                continue;
             }
-            warnings.push(message);
-            client.stop().await.ok();
-            continue;
+            any_pass_sent = true;
+            tokio::time::sleep(Duration::from_millis(config.discovery_window_ms)).await;
+
+            for device in collect_discovered_devices(&client).await {
+                by_instance.insert(device.instance, device);
+            }
         }
 
-        tokio::time::sleep(Duration::from_millis(config.discovery_window_ms)).await;
-
-        for device in collect_discovered_devices(&client).await {
-            by_instance.insert(device.instance, device);
+        if !any_pass_sent {
+            client.stop().await.ok();
+            continue;
         }
         client.stop().await?;
     }
@@ -552,27 +564,68 @@ pub(crate) async fn refresh_device_table(
     config: &BacnetConfig,
     device_instances: &[u32],
 ) -> Result<RefreshOutcome> {
+    let requested = normalize_device_instances(device_instances);
+    if requested.is_empty() {
+        return Ok(RefreshOutcome::default());
+    }
+
     client.who_is(None, None).await?;
     tokio::time::sleep(Duration::from_millis(config.discovery_window_ms)).await;
 
-    // Partition into resolved / unresolved from the broadcast cache only. A per-instance
-    // follow-up Who-Is here is both slow (3 s sleep each) and rarely helpful — if a
-    // device's I-Am dropped in the broadcast burst, a unicast Who-Is on the same socket
-    // drops with similar probability. We accept the partial set and let downstream reads
-    // surface per-point failures with clear errors.
-    let mut resolved = Vec::with_capacity(device_instances.len());
+    let mut unresolved = unresolved_device_instances(client, &requested).await;
+    for _ in 0..REFRESH_TARGETED_PASSES {
+        if unresolved.is_empty() {
+            break;
+        }
+        for (low_limit, high_limit) in device_instance_ranges(&unresolved) {
+            client.who_is(Some(low_limit), Some(high_limit)).await?;
+            tokio::time::sleep(REFRESH_TARGETED_WAIT).await;
+        }
+        unresolved = unresolved_device_instances(client, &requested).await;
+    }
+
+    Ok(partition_refresh_outcome(&requested, &unresolved))
+}
+
+async fn unresolved_device_instances(client: &BacnetIpClient, requested: &[u32]) -> Vec<u32> {
     let mut unresolved = Vec::new();
-    for &device_instance in device_instances {
-        if client.get_device(device_instance).await.is_some() {
-            resolved.push(device_instance);
-        } else {
+    for &device_instance in requested {
+        if client.get_device(device_instance).await.is_none() {
             unresolved.push(device_instance);
         }
     }
-    Ok(RefreshOutcome {
+    unresolved
+}
+
+fn normalize_device_instances(device_instances: &[u32]) -> Vec<u32> {
+    let mut instances = device_instances.to_vec();
+    instances.sort_unstable();
+    instances.dedup();
+    instances
+}
+
+fn device_instance_ranges(device_instances: &[u32]) -> Vec<(u32, u32)> {
+    normalize_device_instances(device_instances)
+        .chunks(REFRESH_TARGETED_CHUNK_SIZE)
+        .filter_map(|chunk| Some((*chunk.first()?, *chunk.last()?)))
+        .collect()
+}
+
+fn partition_refresh_outcome(requested: &[u32], unresolved: &[u32]) -> RefreshOutcome {
+    let unresolved_set = unresolved.iter().copied().collect::<HashSet<_>>();
+    let mut resolved = Vec::with_capacity(requested.len());
+    let mut missing = Vec::new();
+    for &device_instance in requested {
+        if unresolved_set.contains(&device_instance) {
+            missing.push(device_instance);
+        } else {
+            resolved.push(device_instance);
+        }
+    }
+    RefreshOutcome {
         resolved,
-        unresolved,
-    })
+        unresolved: missing,
+    }
 }
 
 pub(crate) async fn build_client(
@@ -659,6 +712,30 @@ mod tests {
     fn target_interfaces_defaults_to_unspecified_without_interfaces() {
         let config = BacnetConfig::default();
         assert_eq!(target_interfaces(&config, &[]), vec![Ipv4Addr::UNSPECIFIED]);
+    }
+
+    #[test]
+    fn normalizes_requested_device_instances() {
+        assert_eq!(
+            normalize_device_instances(&[10902, 10700, 10902, 10600]),
+            vec![10600, 10700, 10902]
+        );
+    }
+
+    #[test]
+    fn device_instance_ranges_are_deterministic_and_bounded_by_chunk_size() {
+        let mut instances = (1..=30).rev().collect::<Vec<_>>();
+        instances.extend([3, 3, 29]);
+
+        let ranges = device_instance_ranges(&instances);
+
+        assert_eq!(ranges, vec![(1, 25), (26, 30)]);
+        for (low, high) in ranges {
+            let count = (low..=high)
+                .filter(|instance| instances.contains(instance))
+                .count();
+            assert!(count <= REFRESH_TARGETED_CHUNK_SIZE);
+        }
     }
 
     #[test]
