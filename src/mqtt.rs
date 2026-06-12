@@ -98,6 +98,9 @@ impl RumqttPublisher {
         if let Some(username) = config.username.as_deref().filter(|value| !value.is_empty()) {
             options.set_credentials(username, config.password.clone().unwrap_or_default());
         }
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            anyhow!("RumqttPublisher::new must be called from within a tokio runtime")
+        })?;
         let (client, mut eventloop) = AsyncClient::new(options, OUTBOUND_CHANNEL_CAPACITY);
         let state = Arc::new(ConnectionState::default());
 
@@ -105,7 +108,7 @@ impl RumqttPublisher {
         // Driving it from the publishing task deadlocks: once the channel fills,
         // publish().await blocks waiting for space that only the (then never-polled)
         // event loop could free.
-        let eventloop_task = tokio::spawn({
+        let eventloop_task = runtime.spawn({
             let state = Arc::clone(&state);
             async move {
                 let mut backoff = ReconnectBackoff::default();

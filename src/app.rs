@@ -219,7 +219,8 @@ impl SettingsDraft {
             parse_u64(&self.discovery_window_ms, "discovery window")?;
         config.bacnet.apdu_timeout_ms = parse_u64(&self.apdu_timeout_ms, "APDU timeout")?;
         config.bacnet.poll_concurrency =
-            parse_u64(&self.poll_concurrency, "poll concurrency")? as usize;
+            usize::try_from(parse_u64(&self.poll_concurrency, "poll concurrency")?)
+                .map_err(|_| "Poll concurrency is too large".to_string())?;
         config.bacnet.device_backoff_max_secs =
             parse_u64(&self.device_backoff_max_secs, "device backoff cap")?;
         config.bacnet.discovery_bind_failure_policy = self.discovery_bind_failure_policy;
