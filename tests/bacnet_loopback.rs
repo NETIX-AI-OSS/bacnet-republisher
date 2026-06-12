@@ -120,9 +120,10 @@ async fn polls_present_value_with_rpm() {
         server_net.stop().await.unwrap();
     });
 
-    let outcome = poll_points_once_with_client(&client, &MqttConfig::default(), &[sample_point()], 4, None)
-        .await
-        .unwrap();
+    let outcome =
+        poll_points_once_with_client(&client, &MqttConfig::default(), &[sample_point()], 4, None)
+            .await
+            .unwrap();
 
     assert_eq!(outcome.failures.len(), 0);
     assert_eq!(outcome.warnings.len(), 0);
@@ -182,9 +183,10 @@ async fn falls_back_to_single_read_after_rpm_timeout() {
         server_net.stop().await.unwrap();
     });
 
-    let outcome = poll_points_once_with_client(&client, &MqttConfig::default(), &[sample_point()], 4, None)
-        .await
-        .unwrap();
+    let outcome =
+        poll_points_once_with_client(&client, &MqttConfig::default(), &[sample_point()], 4, None)
+            .await
+            .unwrap();
 
     assert_eq!(outcome.failures.len(), 0);
     assert_eq!(outcome.warnings.len(), 1);

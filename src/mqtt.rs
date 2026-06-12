@@ -145,7 +145,11 @@ impl RumqttPublisher {
             .map_err(|error| anyhow!("failed to enqueue MQTT publish to {topic}: {error}"))
     }
 
-    pub fn enqueue_samples(&mut self, config: &MqttConfig, samples: &[PointSample]) -> PublishStats {
+    pub fn enqueue_samples(
+        &mut self,
+        config: &MqttConfig,
+        samples: &[PointSample],
+    ) -> PublishStats {
         let mut stats = PublishStats::empty();
         for sample in samples {
             stats.queued += 1;

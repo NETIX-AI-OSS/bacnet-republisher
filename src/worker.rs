@@ -730,8 +730,7 @@ pub fn spawn_republisher(
             sender
                 .send(WorkerEvent::RepublisherLifecycle(
                     RepublisherLifecycle::Failed(
-                        "Republisher worker stopped unexpectedly; see log for details"
-                            .to_string(),
+                        "Republisher worker stopped unexpectedly; see log for details".to_string(),
                     ),
                 ))
                 .ok();
