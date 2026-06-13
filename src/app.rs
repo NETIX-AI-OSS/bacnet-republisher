@@ -53,6 +53,8 @@ pub struct BacnetRepublisher {
     working: bool,
     republisher_state: RepublisherLifecycle,
     republisher_stop: Option<Arc<AtomicBool>>,
+    // Two-press guard for the destructive "Clear all local objects" action.
+    clear_points_armed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +111,7 @@ pub enum Message {
     SavePoint,
     EditPoint(usize),
     DeletePoint(usize),
+    ClearAllPoints,
     NewPoint,
     TogglePoint(usize, bool),
 }
@@ -351,6 +354,7 @@ impl BacnetRepublisher {
                 working: false,
                 republisher_state: RepublisherLifecycle::Stopped,
                 republisher_stop: None,
+                clear_points_armed: false,
             },
             Task::none(),
         )
@@ -373,6 +377,15 @@ impl BacnetRepublisher {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Any interaction other than the periodic event drain disarms a pending
+        // "clear all" confirmation, so the destructive wipe needs a deliberate
+        // double-press and cannot fire after the user has moved on to something else.
+        if !matches!(
+            message,
+            Message::ClearAllPoints | Message::DrainWorkerEvents
+        ) {
+            self.clear_points_armed = false;
+        }
         match message {
             Message::SelectPage(page) => self.selected_page = page,
             Message::ThemeSelected(theme) => {
@@ -452,6 +465,7 @@ impl BacnetRepublisher {
             Message::SavePoint => self.save_point(),
             Message::EditPoint(index) => self.edit_point(index),
             Message::DeletePoint(index) => self.delete_point(index),
+            Message::ClearAllPoints => self.clear_all_points(),
             Message::NewPoint => {
                 self.selected_point = None;
                 self.point_editor = PointEditor::new();
@@ -989,7 +1003,22 @@ impl BacnetRepublisher {
             .spacing(12),
         );
 
-        let mut list = column![ui::section_title(palette, "Configured points")].spacing(8);
+        let clear_label = if self.clear_points_armed {
+            "Confirm clear"
+        } else {
+            "Clear all"
+        };
+        let mut clear_button =
+            ui::action_button(palette, Icon::Delete, clear_label, ButtonKind::Danger);
+        if !self.config.points.is_empty() || !self.scanned_objects.is_empty() {
+            clear_button = clear_button.on_press(Message::ClearAllPoints);
+        }
+        let mut list = column![row![
+            container(ui::section_title(palette, "Configured points")).width(Length::Fill),
+            clear_button,
+        ]
+        .align_y(Alignment::Center)]
+        .spacing(8);
         if self.config.points.is_empty() {
             list = list.push(empty_state(
                 palette,
@@ -1833,6 +1862,47 @@ impl BacnetRepublisher {
         }
     }
 
+    /// Clear every locally-held object: the configured/republished points and the
+    /// cached object-scan results. Used to drop a stale points table (e.g. after the
+    /// upstream BACnet identities changed) before a fresh Discover. Two-press guarded:
+    /// the first press arms the confirmation, the second performs the wipe.
+    fn clear_all_points(&mut self) {
+        let points = self.config.points.len();
+        let objects = self.scanned_objects.len();
+        if points == 0 && objects == 0 {
+            self.clear_points_armed = false;
+            self.set_status(LogLevel::Info, "No local objects to clear.");
+            return;
+        }
+        if !self.clear_points_armed {
+            self.clear_points_armed = true;
+            self.set_status(
+                LogLevel::Warning,
+                format!(
+                    "Press 'Confirm clear' again to remove {} configured point(s) and \
+                     {objects} scanned object(s). Any other action cancels.",
+                    points
+                ),
+            );
+            return;
+        }
+        self.config.points.clear();
+        self.scanned_objects.clear();
+        self.point_statuses.clear();
+        self.last_sample_batch.clear();
+        self.selected_point = None;
+        self.point_editor = PointEditor::new();
+        self.clear_points_armed = false;
+        self.save_config_with_status();
+        self.set_status(
+            LogLevel::Info,
+            format!(
+                "Cleared {points} configured point(s) and {objects} scanned object(s). \
+                 Run Discover to repopulate from the current devices."
+            ),
+        );
+    }
+
     fn save_settings(&mut self) {
         let mut next = self.config.clone();
         match self.settings.apply_to(&mut next) {
@@ -2269,6 +2339,7 @@ mod sample_state_tests {
             working: false,
             republisher_state: RepublisherLifecycle::Stopped,
             republisher_stop: None,
+            clear_points_armed: false,
         }
     }
 
@@ -2290,6 +2361,39 @@ mod sample_state_tests {
             value: TelemetryValue::Number(value),
             timestamp_ms,
         }
+    }
+
+    #[test]
+    fn clear_all_points_requires_two_presses_and_any_other_action_cancels() {
+        let mut app = app_for_tests();
+        app.config_path =
+            std::env::temp_dir().join(format!("brp-clear-test-{}.toml", std::process::id()));
+        app.config.points = vec![point(1), point(2), point(3)];
+
+        // First press only arms the confirmation; nothing is removed yet.
+        let _ = app.update(Message::ClearAllPoints);
+        assert!(app.clear_points_armed);
+        assert_eq!(app.config.points.len(), 3);
+
+        // Any unrelated interaction disarms the pending confirmation...
+        let _ = app.update(Message::SelectPage(Page::Points));
+        assert!(!app.clear_points_armed);
+        // ...so a subsequent lone press just re-arms rather than wiping.
+        let _ = app.update(Message::ClearAllPoints);
+        assert!(app.clear_points_armed);
+        assert_eq!(app.config.points.len(), 3);
+
+        // The periodic event drain must NOT disarm (it fires every 250ms).
+        let _ = app.update(Message::DrainWorkerEvents);
+        assert!(app.clear_points_armed);
+
+        // Second deliberate press performs the wipe and resets the guard.
+        let _ = app.update(Message::ClearAllPoints);
+        assert!(app.config.points.is_empty());
+        assert!(app.scanned_objects.is_empty());
+        assert!(!app.clear_points_armed);
+
+        let _ = std::fs::remove_file(&app.config_path);
     }
 
     #[test]
