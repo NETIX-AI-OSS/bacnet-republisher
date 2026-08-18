@@ -248,10 +248,7 @@ pub async fn poll_points_once(
         }
     };
 
-    // Pre-filter: don't even attempt reads to unresolved devices. Each unresolved device
-    // would otherwise produce one "RPM failed" warning + one fast-fail per point as the
-    // RPM fallback path tries individual reads. Mark them as point failures upfront with
-    // a single clean reason.
+    // Pre-filter unresolved devices; skip reads to avoid RPM-fallback warning spam.
     let unresolved_set: HashSet<u32> = refresh.unresolved.iter().copied().collect();
     let (pollable, skipped): (Vec<PointConfig>, Vec<PointConfig>) = enabled
         .into_iter()
@@ -321,9 +318,7 @@ pub async fn poll_points_once_with_client(
         }
     }
 
-    // Device groups are read concurrently (the client's TSM correlates responses
-    // by (mac, invoke_id)), so one dead device's APDU timeouts don't stall the
-    // other devices' schedules.
+    // Device groups read concurrently; one dead device can't stall the others.
     let group_results = stream::iter(by_device)
         .map(|(device_instance, requests)| async move {
             if is_cancelled(cancel) {
@@ -632,8 +627,7 @@ pub(crate) async fn build_client(
     config: &BacnetConfig,
     interface: Ipv4Addr,
 ) -> Result<BacnetIpClient> {
-    // Port 0 binds an ephemeral UDP port so I-Am unicasts are not captured by another
-    // BACnet stack (e.g. a local simulator) listening on 47808.
+    // Port 0: ephemeral port so I-Am replies aren't captured by another stack.
     let mut transport = BipTransport::new(interface, config.port, config.broadcast_address);
     if let Some(bbmd) = &config.bbmd {
         transport.register_as_foreign_device(ForeignDeviceConfig {

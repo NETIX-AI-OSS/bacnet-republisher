@@ -72,8 +72,7 @@ jobs:
   windows:
     name: Build Windows executable (signed)
     runs-on: windows-2025-vs2026
-    # Azure Trusted Signing via GitHub OIDC; the Entra app federated
-    # credential is scoped to this environment.
+    # Azure Trusted Signing via GitHub OIDC; Entra federated credential scoped here.
     environment: release
     permissions:
       contents: read

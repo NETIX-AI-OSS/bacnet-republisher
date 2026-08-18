@@ -114,9 +114,7 @@ pub fn spawn_scan_all_objects(
                 .send(WorkerEvent::ScanProgress { current: 0, total })
                 .ok();
 
-            // One shared client for the whole sweep. Building a fresh client per device
-            // re-broadcasts Who-Is and races against the simulator's I-Am responses, which
-            // is why per-device scans fail under load.
+            // One shared client for the sweep; per-device clients race Who-Is/I-Am.
             let bind = resolve_bacnet_bind_address(&config, &interfaces);
             let mut client = match build_client(&config, bind).await {
                 Ok(c) => c,
@@ -472,8 +470,7 @@ fn update_device_backoffs(
                 ),
             ));
         }
-        // Neither sampled nor failed: the cycle was cancelled before this device
-        // was reached — leave its backoff state untouched.
+        // Neither sampled nor failed: cycle was cancelled before this device.
     }
     messages
 }
@@ -615,9 +612,7 @@ pub fn spawn_republisher(
                 }
             };
 
-            // ONE BACnet client for the lifetime of the republisher. Building/tearing down
-            // per poll cycle races on the UDP port bind ("Address already in use") because
-            // the kernel hasn't released 47808 by the time the next cycle reclaims it.
+            // One long-lived client; per-cycle clients race the UDP port bind.
             let bind = resolve_bacnet_bind_address(&bacnet, &interfaces);
             let mut client = match build_client(&bacnet, bind).await {
                 Ok(c) => c,
@@ -719,9 +714,7 @@ pub fn spawn_republisher(
                     }
                 }
 
-                // Devices that missed the startup Who-Is window (or rebooted with a new
-                // address) get periodic re-resolution attempts instead of being skipped
-                // until the republisher is restarted.
+                // Devices missed at startup (or re-addressed) get periodic re-resolution.
                 if !refreshed_this_iteration
                     && !unresolved_devices.is_empty()
                     && last_resolve_attempt.elapsed() >= DEVICE_RERESOLVE_INTERVAL
@@ -875,9 +868,7 @@ pub fn spawn_republisher(
                 ))
                 .ok();
         });
-        // Covers both runtime startup failure and a panic anywhere in the worker —
-        // without this the UI would stay in Starting/Running/Stopping forever with
-        // no way to restart.
+        // Covers startup failure or a panic; without it the UI never leaves Starting.
         if !completed {
             sender
                 .send(WorkerEvent::RepublisherLifecycle(
@@ -1159,8 +1150,7 @@ mod tests {
         let now = Instant::now();
         let max = Duration::from_secs(300);
 
-        // Device 200 was in the poll set but produced neither samples nor
-        // failures (cycle cancelled before it was reached).
+        // Device 200 was polled but produced neither a sample nor a failure.
         update_device_backoffs(&mut backoffs, &polled, &outcome_with(&[100], &[]), now, max);
         assert!(!backoffs.contains_key(&200));
     }
