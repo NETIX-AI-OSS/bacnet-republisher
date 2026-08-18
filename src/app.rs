@@ -1860,10 +1860,7 @@ impl BacnetRepublisher {
         }
     }
 
-    /// Clear every locally-held object: the configured/republished points and the
-    /// cached object-scan results. Used to drop a stale points table (e.g. after the
-    /// upstream BACnet identities changed) before a fresh Discover. Two-press guarded:
-    /// the first press arms the confirmation, the second performs the wipe.
+    /// Clears configured points and cached scan results; two-press guarded (first press arms, second wipes).
     fn clear_all_points(&mut self) {
         let points = self.config.points.len();
         let objects = self.scanned_objects.len();
