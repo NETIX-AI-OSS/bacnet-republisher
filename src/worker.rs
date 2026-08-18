@@ -396,16 +396,13 @@ pub fn spawn_poll_and_publish(
     });
 }
 
-/// How often the republisher re-broadcasts Who-Is for devices that are not yet
-/// in the I-Am cache (missed at startup, rebooted, or readdressed).
+/// How often the republisher re-broadcasts Who-Is for devices missing from the I-Am cache.
 const DEVICE_RERESOLVE_INTERVAL: Duration = Duration::from_secs(60);
 /// Refresh all known device addresses before bacnet-client's 600s device table TTL.
 const DEVICE_TABLE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(240);
-/// Upper bound on BACnet client shutdown so a hung transport can't wedge the
-/// lifecycle in `Stopping`.
+/// Upper bound on BACnet client shutdown so a hung transport can't wedge the lifecycle in `Stopping`.
 const CLIENT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-/// First retry delay for a device whose reads all failed; doubles per failed
-/// attempt up to the configured `device_backoff_max_secs`.
+/// First retry delay for a device whose reads all failed; doubles per failed attempt up to `device_backoff_max_secs`.
 const DEVICE_BACKOFF_INITIAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy)]
@@ -420,9 +417,7 @@ struct RefreshStateChange {
     newly_unresolved: HashSet<u32>,
 }
 
-/// Escalates backoff for devices where every read failed this cycle and clears
-/// it for devices that produced at least one sample. Returns log messages for
-/// the caller to emit.
+/// Escalates backoff for devices that failed every read this cycle, clears it for the rest, and returns log messages.
 fn update_device_backoffs(
     backoffs: &mut HashMap<u32, DeviceBackoff>,
     polled_devices: &HashSet<u32>,
@@ -537,8 +532,7 @@ fn emit_refresh_state_change(
     }
 }
 
-/// Mark every enabled point on an unresolved device as failed, so the UI and the
-/// MQTT health snapshot report them stale instead of silently skipping them.
+/// Marks every enabled point on an unresolved device as failed, so the UI/health snapshot report them stale instead of silently skipping.
 fn record_unresolved_failures(
     sender: &Sender<WorkerEvent>,
     points: &[PointConfig],
@@ -881,9 +875,7 @@ pub fn spawn_republisher(
     });
 }
 
-/// Shared post-poll emit sequence: log failures/warnings, publish samples and health,
-/// then send the `Failures`, `Samples`, and `PublishStatus` events to the UI.
-/// Returns a human-readable summary string (used by one-shot callers as a `Finished` message).
+/// Shared post-poll sequence: logs failures/warnings, publishes samples and health, sends UI events, and returns a summary string.
 async fn emit_poll_outcome(
     sender: &Sender<WorkerEvent>,
     publisher: &mut RumqttPublisher,
@@ -937,10 +929,7 @@ async fn emit_poll_outcome(
     )
 }
 
-/// Runs the worker future to completion, returning false if the runtime could not
-/// start or the future panicked. A panicking worker must not die silently: the UI
-/// cannot observe thread death (it holds its own sender clone, so the channel never
-/// disconnects) and would otherwise show a stale state forever.
+/// Returns false on runtime-start failure or panic; must report panics because the UI holds its own sender clone and can't detect thread death.
 fn run_async<F>(sender: Sender<WorkerEvent>, future: F) -> bool
 where
     F: std::future::Future<Output = ()>,

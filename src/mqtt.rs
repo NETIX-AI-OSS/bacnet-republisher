@@ -148,8 +148,7 @@ impl RumqttPublisher {
         })
     }
 
-    /// Hand a publish to the event loop without blocking. Fails fast when the
-    /// outbound channel is full (broker down long enough to back up the queue).
+    /// Hands a publish to the event loop without blocking; fails fast if the outbound channel is full.
     fn enqueue(&self, topic: &str, payload: Vec<u8>, retain: bool) -> Result<()> {
         self.client
             .try_publish(topic, QoS::AtLeastOnce, retain, payload)

@@ -152,8 +152,7 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// Stamps the in-memory config with the current version number and applies
-    /// one-time upgrades from older saved configs.
+    /// Stamps the config with the current version and applies one-time upgrades from older saves.
     pub fn migrate(&mut self) {
         if self.version < 3 && self.bacnet.port == default_bacnet_device_port() {
             // Ephemeral port avoids UDP/47808 conflicts with another local BACnet stack.
@@ -342,8 +341,7 @@ pub fn save_to_path(path: &Path, config: &AppConfig) -> Result<()> {
     fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))
 }
 
-/// Local UDP bind port for the BACnet client. `0` lets the OS assign an ephemeral
-/// port so I-Am responses are not stolen by another process listening on 47808.
+/// `0` lets the OS assign an ephemeral port so I-Am responses aren't stolen by another listener on 47808.
 fn default_bacnet_port() -> u16 {
     0
 }

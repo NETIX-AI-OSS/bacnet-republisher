@@ -1,9 +1,4 @@
-//! Default BACnet point definitions aligned with `bacnet-simulator/config.yaml`.
-//!
-//! Device IDs follow the simulator's `id_policy` (block_index + 1) * 100 + base 10000):
-//!   - PLANT-MTR-001 = 10600 (template block 6: plant_meter)
-//!   - AHU-L-001     = 10700 (template block 7: ahu_large)
-//!   - VAV-OFC-001   = 10900 (template block 9: vav_office)
+//! Default BACnet points aligned with `bacnet-simulator/config.yaml`; device IDs follow its `id_policy` formula.
 use crate::model::PointConfig;
 
 pub fn simulator_points() -> Vec<PointConfig> {
