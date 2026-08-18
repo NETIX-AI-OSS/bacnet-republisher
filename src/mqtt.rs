@@ -15,9 +15,7 @@ use tokio::time::sleep;
 
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
-// Bounds how many QoS 1 publishes can sit waiting for the event loop. While the broker
-// is unreachable the channel fills and try_publish() fails fast — samples are dropped
-// and counted, never blocking the poll loop. Sized for full-fleet bursts (~1500 points).
+// Bounds queued QoS 1 publishes; full channel fails fast, never blocks polling.
 const OUTBOUND_CHANNEL_CAPACITY: usize = 4096;
 
 pub trait MqttPublisher {
@@ -122,10 +120,7 @@ impl RumqttPublisher {
         let (client, mut eventloop) = AsyncClient::new(options, OUTBOUND_CHANNEL_CAPACITY);
         let state = Arc::new(ConnectionState::default());
 
-        // The event loop runs in its own task so the request channel always drains.
-        // Driving it from the publishing task deadlocks: once the channel fills,
-        // publish().await blocks waiting for space that only the (then never-polled)
-        // event loop could free.
+        // Event loop runs in its own task; driving it from publish() would deadlock.
         let eventloop_task = runtime.spawn({
             let state = Arc::clone(&state);
             async move {

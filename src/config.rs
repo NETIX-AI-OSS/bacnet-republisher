@@ -156,8 +156,7 @@ impl AppConfig {
     /// one-time upgrades from older saved configs.
     pub fn migrate(&mut self) {
         if self.version < 3 && self.bacnet.port == default_bacnet_device_port() {
-            // Ephemeral local port avoids UDP/47808 conflicts with a BACnet device or
-            // simulator bound on the same host (common on Windows co-hosted setups).
+            // Ephemeral port avoids UDP/47808 conflicts with another local BACnet stack.
             self.bacnet.port = 0;
         }
         self.version = CURRENT_CONFIG_VERSION;

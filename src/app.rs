@@ -377,9 +377,7 @@ impl BacnetRepublisher {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        // Any interaction other than the periodic event drain disarms a pending
-        // "clear all" confirmation, so the destructive wipe needs a deliberate
-        // double-press and cannot fire after the user has moved on to something else.
+        // Non-drain interactions disarm a pending "clear all"; wipe needs 2 presses.
         if !matches!(
             message,
             Message::ClearAllPoints | Message::DrainWorkerEvents
@@ -2603,16 +2601,14 @@ mod tests {
     fn format_timestamp_valid_millis() {
         // 2024-01-15 00:00:00 UTC = 1705276800000 ms
         let result = format_timestamp(1_705_276_800_000);
-        // The string format is "%Y-%m-%d %H:%M:%S" in local time; just verify it
-        // is non-empty and contains a date-like structure.
+        // Format is "%Y-%m-%d %H:%M:%S"; just check it looks date-like.
         assert!(result.contains('-'), "expected date separator: {result}");
         assert!(result.contains(':'), "expected time separator: {result}");
     }
 
     #[test]
     fn format_timestamp_negative_millis_returns_pre_epoch_date() {
-        // chrono's from_timestamp_millis accepts negative values (pre-epoch).
-        // The result should be a formatted date string, not the raw integer.
+        // chrono accepts negative (pre-epoch) millis; expect a formatted date.
         let result = format_timestamp(-1);
         assert!(
             result.contains('-'),
@@ -2711,10 +2707,7 @@ mod tests {
     }
 
     // --- initial_page ---
-    //
-    // These tests mutate the process environment, which is shared across
-    // Rust's parallel test threads. We serialize all three under a single
-    // Mutex so they cannot interfere with each other.
+    // These tests mutate env vars; serialized under a Mutex (shared across threads).
 
     use std::sync::Mutex;
     static ENV_LOCK: Mutex<()> = Mutex::new(());
