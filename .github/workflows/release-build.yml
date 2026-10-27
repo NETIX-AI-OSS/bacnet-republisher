@@ -67,6 +67,7 @@ jobs:
         with:
           name: bacnet-republisher-linux-x86_64
           path: dist/*.zip
+          retention-days: 3
           if-no-files-found: error
 
   windows:
@@ -147,6 +148,7 @@ jobs:
         with:
           name: bacnet-republisher-windows-x86_64
           path: dist/*.zip
+          retention-days: 3
           if-no-files-found: error
 
   publish:
