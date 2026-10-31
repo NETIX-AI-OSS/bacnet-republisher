@@ -52,4 +52,7 @@ winresource = "0.1"
 # bind port, which breaks Who-Is discovery from an ephemeral-port client.
 # See vendor/bacnet-transport/src/bip/mod.rs (broadcast_port).
 [patch.crates-io]
+# Reuse the reviewed MQTT verifier fix until rumqttc publishes a compatible release.
+rumqttc = { git = "https://github.com/NETIX-AI-OSS/netix-protocol-core", rev = "ca9bc0402d0b91723fad831566d59cb45c4c8d61" }
+
 bacnet-transport = { path = "vendor/bacnet-transport" }
