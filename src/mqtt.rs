@@ -1,7 +1,9 @@
 use crate::config::MqttConfig;
 use crate::model::{PointSample, PublishStats};
 use anyhow::{anyhow, Context, Result};
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, TlsConfiguration, Transport};
+use rumqttc::{
+    AsyncClient, Event, MqttOptions, Packet, PublishOptions, QoS, TlsConfiguration, Transport,
+};
 use serde_json::json;
 use std::fs;
 use std::future::Future;
@@ -108,8 +110,11 @@ pub struct RumqttPublisher {
 impl RumqttPublisher {
     /// Must be called from within a tokio runtime: the event loop runs in a spawned task.
     pub fn new(config: &MqttConfig) -> Result<Self> {
-        let mut options = MqttOptions::new(&config.client_id, &config.host, config.port);
-        options.set_keep_alive(Duration::from_secs(config.keep_alive_secs.max(5)));
+        let mut options = MqttOptions::new(&config.client_id, (config.host.as_str(), config.port));
+        options.set_keep_alive(
+            u16::try_from(config.keep_alive_secs.max(5))
+                .context("MQTT keep-alive exceeds the 65535-second protocol limit")?,
+        );
         options.set_transport(build_transport(config)?);
         if let Some(username) = config.username.as_deref().filter(|value| !value.is_empty()) {
             options.set_credentials(username, config.password.clone().unwrap_or_default());
@@ -117,7 +122,9 @@ impl RumqttPublisher {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             anyhow!("RumqttPublisher::new must be called from within a tokio runtime")
         })?;
-        let (client, mut eventloop) = AsyncClient::new(options, OUTBOUND_CHANNEL_CAPACITY);
+        let (client, mut eventloop) = AsyncClient::builder(options)
+            .capacity(OUTBOUND_CHANNEL_CAPACITY)
+            .build();
         let state = Arc::new(ConnectionState::default());
 
         // Event loop runs in its own task; driving it from publish() would deadlock.
@@ -151,7 +158,11 @@ impl RumqttPublisher {
     /// Hands a publish to the event loop without blocking; fails fast if the outbound channel is full.
     fn enqueue(&self, topic: &str, payload: Vec<u8>, retain: bool) -> Result<()> {
         self.client
-            .try_publish(topic, QoS::AtLeastOnce, retain, payload)
+            .try_publish(
+                topic,
+                payload,
+                PublishOptions::new(QoS::AtLeastOnce).retain(retain),
+            )
             .map_err(|error| anyhow!("failed to enqueue MQTT publish to {topic}: {error}"))
     }
 
