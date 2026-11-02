@@ -12,7 +12,9 @@ permissions:
 jobs:
   check:
     name: Format, clippy, and tests
-    runs-on: [build-only, Linux, X64]
+    runs-on:
+      group: default
+      labels: [build-only, Linux, X64]
     container: rust:1.96.0-bookworm
 
     steps:
