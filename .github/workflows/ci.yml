@@ -13,7 +13,7 @@ jobs:
   check:
     name: Format, clippy, and tests
     runs-on:
-      group: default
+      group: e2e-worker
       labels: [build-only, Linux, X64]
     container: rust:1.96.0-bookworm
 

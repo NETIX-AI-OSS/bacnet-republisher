@@ -12,7 +12,7 @@ jobs:
   linux:
     name: Build Linux executable
     runs-on:
-      group: default
+      group: e2e-worker
       labels: [build-only, Linux, X64]
     container: rust:1.96.0-bookworm
 
@@ -160,7 +160,7 @@ jobs:
     name: Publish GitHub release
     needs: [linux, windows]
     runs-on:
-      group: default
+      group: e2e-worker
       labels: [build-only, Linux, X64]
     container: rust:1.96.0-bookworm
     permissions:
