@@ -12,9 +12,14 @@ permissions:
 jobs:
   check:
     name: Format, clippy, and tests
-    runs-on: ubuntu-24.04
+    runs-on:
+      group: e2e-worker
+      labels: [build-only, Linux, X64]
+    container: rust:1.96.0-bookworm
 
     steps:
+      - name: Install container build tools
+        run: apt-get update && apt-get install -y --no-install-recommends cmake perl pkg-config
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -26,8 +31,8 @@ jobs:
 
       - name: Install Linux build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          apt-get update
+          apt-get install -y \
             pkg-config \
             libxkbcommon-dev \
             libwayland-dev \
