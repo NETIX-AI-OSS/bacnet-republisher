@@ -2033,11 +2033,11 @@ impl BacnetRepublisher {
 
     fn live_value_text(&self, point: &PointConfig) -> String {
         let Some(status) = self.point_statuses.get(&PointIdentity::from_point(point)) else {
-            return "—".to_string();
+            return "N/A".to_string();
         };
         match &status.last_value {
             Some(value) => value.to_string(),
-            None => "—".to_string(),
+            None => "N/A".to_string(),
         }
     }
 
