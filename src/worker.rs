@@ -275,7 +275,7 @@ pub fn spawn_scan_all_objects(
                 .ok();
             sender
                 .send(WorkerEvent::Finished(format!(
-                    "Scanned {scanned} object(s) across {total} device(s) ({failures} failure(s), {unresolved_scans} unresolved) — {added} point(s) added, {updated} updated, {total_points} total"
+                    "Scanned {scanned} object(s) across {total} device(s) ({failures} failure(s), {unresolved_scans} unresolved), {added} point(s) added, {updated} updated, {total_points} total"
                 )))
                 .ok();
         });
